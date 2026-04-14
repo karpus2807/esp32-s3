@@ -1,0 +1,11 @@
+backup/
+build/
+*.bin
+*.o
+*.d
+*.elf
+.tools/
+.theia/
+.arduino-cli.yaml
+.codex
+*.pdf

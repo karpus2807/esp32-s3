@@ -1,0 +1,7 @@
+# Match board menu: OPI PSRAM + custom partitions (see partitions.csv / ci.yml).
+profiles:
+  esp32s3_eth:
+    fqbn: esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=custom,USBMode=hwcdc,CDCOnBoot=default,UploadMode=default,FlashMode=qio
+    platforms:
+      - platform: esp32:esp32 (3.3.7)
+default_profile: esp32s3_eth

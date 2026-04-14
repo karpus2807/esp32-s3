@@ -1,0 +1,207 @@
+================================================================================
+ESP32-S3 CCTV — device commands (primary: web dashboard "Device control")
+================================================================================
+Optional serial (board_config.h: CCTV_ENABLE_SERIAL_CONSOLE=1, baud 115200).
+Type one full line and press Enter. Commands are case-insensitive unless noted.
+WiFi SSID numbers come from the last successful "wifiscan" (max 20 listed).
+
+  Arduino build (ESP32-S3-WROOM N16R8, 8 MB PSRAM): Tools → PSRAM → **OPI PSRAM**
+  (arduino-cli: …PSRAM=opi…). "QSPI PSRAM" / PSRAM=enabled does NOT init octal PSRAM;
+  devstatus then shows heap_caps SPIRAM tot=0.
+
+--------------------------------------------------------------------------------
+Ethernet-only serial (default ON when full console OFF)
+--------------------------------------------------------------------------------
+  If CCTV_ENABLE_SERIAL_CONSOLE=0 and CCTV_ENABLE_ETH_SERIAL_MINI=1 (defaults), a
+  small task reads Serial for device status + Ethernet commands (same as web Device control):
+
+    devstatus
+    ethdhcp
+    ethstatic                    (fixed defaults — see ethstatic section)
+    ethstatic <ip> <mask> <gateway> [dns]
+    help   (or ? or eth) — print this list
+
+  Full console (CCTV_ENABLE_SERIAL_CONSOLE=1) handles all commands including these;
+  the mini Ethernet task is not started in that case.
+
+--------------------------------------------------------------------------------
+wifiscan
+--------------------------------------------------------------------------------
+  Scans for WiFi networks (takes a few seconds). Lists [#] SSID, RSSI, auth, ch.
+  Always run this before using "<n> norm ..." or "<n> ent ...".
+
+  Example:
+    wifiscan
+
+--------------------------------------------------------------------------------
+<n> norm pass:<password>
+--------------------------------------------------------------------------------
+  Connect to SSID line number <n> from last wifiscan using WPA/WPA2/WPA3
+  Personal (PSK). Saves credentials to NVS (up to three SSIDs in separate slots;
+  same SSID updates its slot). Then connects using failover: preferred slot first,
+  then other saved profiles if the AP is down or out of range. No automatic reboot.
+
+  Examples:
+    3 norm pass:MyHomeWiFiSecret
+    1 norm pass:
+
+  (Blank password after pass: keeps an already-saved password in NVS — rare.)
+
+--------------------------------------------------------------------------------
+<n> ent user:<identity> pass:<password>
+--------------------------------------------------------------------------------
+  Same as above but WPA-Enterprise (PEAP / MSCHAPv2 style). user: is LDAP/EAP
+  username/identity. `user@domain` is optional; plain username also works.
+  Saves to NVS (same 3-slot rules as norm) and connects with profile failover.
+
+  Example:
+    2 ent user:john@company.com pass:MyLdapPassword
+
+--------------------------------------------------------------------------------
+wifistatus
+--------------------------------------------------------------------------------
+  Prints WiFi status string, wl_status_t, IP/RSSI if connected, and a short
+  Ethernet + primary IP summary.
+
+  Example:
+    wifistatus
+
+--------------------------------------------------------------------------------
+wifiprofiles
+--------------------------------------------------------------------------------
+  Lists all three WiFi profile slots (SSID, enterprise yes/no, whether PSK/EAP
+  secrets are stored — not the secrets themselves) and which slot is preferred.
+
+  Example:
+    wifiprofiles
+
+--------------------------------------------------------------------------------
+wifidel <0|1|2>
+--------------------------------------------------------------------------------
+  Clears one profile slot in NVS. Slot indices are 0, 1, 2 (same as web UI
+  “Slot 1–3”). Preferred slot is adjusted if you delete it. Space after
+  wifidel is optional (e.g. wifidel0).
+
+  Example:
+    wifidel 1
+
+--------------------------------------------------------------------------------
+devstatus
+--------------------------------------------------------------------------------
+  One snapshot: uptime, SDK/CPU, estimated core loads, internal RAM + PSRAM,
+  flash chip size + sketch used + free space in app partition (room for more code),
+  WiFi status/MAC/IP/RSSI, full Ethernet (W5500) diagnostics, primary IP, SD free/total.
+
+  Example:
+    devstatus
+
+--------------------------------------------------------------------------------
+ethstatic
+--------------------------------------------------------------------------------
+  Short form (no arguments) — applies fixed defaults (same as web “ETH static” button):
+
+    IP     10.0.0.20
+    Mask   255.255.255.0
+    GW     10.0.0.1
+    DNS    8.8.8.8
+
+  Override in board_config.h: CCTV_ETH_STATIC_DEFAULT_IP / _MASK / _GW / _DNS
+
+  Example:
+    ethstatic
+
+  Then set your laptop manual IPv4 on 10.0.0.x (not .20), same mask, e.g.
+  gateway 10.0.0.1, open http://10.0.0.20/
+
+--------------------------------------------------------------------------------
+ethstatic <ip> <mask> <gateway> [dns]
+--------------------------------------------------------------------------------
+  Long form: custom static IPv4 for direct cable or lab. Saves to NVS, applies
+  on Ethernet. Optional 4th argument is DNS; if omitted, gateway is used as DNS.
+
+  Examples:
+    ethstatic 192.168.1.50 255.255.255.0 192.168.1.1
+    ethstatic 10.0.0.20 255.255.255.0 10.0.0.1 8.8.8.8
+
+  Open http://<board-ip>/  (http only). Mini-DHCP for laptop “auto” IPv4 may
+  be unavailable on some builds — manual laptop IP on same /24 is safest.
+
+--------------------------------------------------------------------------------
+ethdhcp
+--------------------------------------------------------------------------------
+  Clears Ethernet static NVS. Restarts the normal DHCP client so the board gets
+  an address from your router or organisation LAN. Use devstatus if no IPv4 yet.
+
+  Example:
+    ethdhcp
+
+--------------------------------------------------------------------------------
+timeurl
+timeurl off
+timeurl default
+timeurl <http(s) url>
+--------------------------------------------------------------------------------
+  HTTP JSON time source (e.g. API returning "unixtime"). Shown if enabled.
+  "off" disables and saves. "default" removes NVS key and uses firmware default
+  from board_config.h (CCTV_WORLD_TIME_HTTP_URL). Full URL saves to NVS;
+  if Wi‑Fi or Ethernet has a routable IP, sync runs immediately (and again
+  when the link comes up later if the clock was still unset).
+
+  Wall time across full power loss needs an external RTC with battery (e.g.
+  DS3231); the ESP32 cannot keep calendar time with the main supply removed.
+
+  Examples:
+    timeurl
+    timeurl off
+    timeurl default
+    timeurl http://worldtimeapi.org/api/ip
+
+--------------------------------------------------------------------------------
+clearwifi
+--------------------------------------------------------------------------------
+  Erases all saved WiFi profiles (three slots + legacy keys) from NVS.
+  Does not reboot.
+
+  Example:
+    clearwifi
+
+--------------------------------------------------------------------------------
+reboot
+--------------------------------------------------------------------------------
+  Restarts the ESP32-S3.
+
+  Example:
+    reboot
+
+================================================================================
+Quick workflows
+================================================================================
+
+  A) First-time WiFi (after wifiscan):
+       wifiscan
+       2 norm pass:YourPassword
+
+  B) Direct cable laptop ↔ board (no router): one command + laptop manual IP:
+       ethstatic
+       Laptop e.g. 10.0.0.10  mask 255.255.255.0  gw 10.0.0.1  →  http://10.0.0.20/
+
+  C) Organisation / office LAN (router DHCP):
+       ethdhcp
+       (Serial shows acquired IPv4 when router answers; else devstatus)
+
+  D) After (B), go back to office LAN:
+       ethdhcp
+       reboot   (optional if behaviour looks odd)
+
+================================================================================
+Web UI — same device (recommended)
+================================================================================
+  Dashboard:        http://<device-ip>/
+  WiFi JSON API:    http://<device-ip>/wifi
+  Run any command:  GET http://<device-ip>/api/console?cmd=wifistatus
+  Session log RAM:  GET http://<device-ip>/api/logs?enable=1  (optional ~16KB)
+  Use http:// not https:// (no TLS on device).
+
+================================================================================
+End of list (firmware: cctv_web_control_dispatch + optional serialConsoleTask)
+================================================================================

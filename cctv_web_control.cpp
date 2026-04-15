@@ -75,56 +75,78 @@ void cctv_web_control_dispatch(const String &line, Print &out) {
     return;
   }
 
+  // --- WiFi auto-connect control ---
+  if (line.equalsIgnoreCase("autowifi on")) {
+    g_wifiAutoConnect = true;
+    saveWifiAutoConnect();
+    out.println(F("[CON] WiFi auto-connect ENABLED (device will auto-connect if not connected)"));
+    return;
+  }
+  if (line.equalsIgnoreCase("autowifi off")) {
+    g_wifiAutoConnect = false;
+    saveWifiAutoConnect();
+    out.println(F("[CON] WiFi auto-connect DISABLED (device will stay idle until manual scan/connect)"));
+    return;
+  }
   if (line.equalsIgnoreCase("wifiscan")) {
     cctv_wifi_lock();
-    out.println(F("[CON] Scanning WiFi networks..."));
-    WiFi.disconnect(false);
-    vTaskDelay(300 / portTICK_PERIOD_MS);
-    out.println(F("[CON] Please wait ~3s..."));
-    s_scan_count = WiFi.scanNetworks(false, true);
-    if (s_scan_count == WIFI_SCAN_FAILED || s_scan_count < 0) {
-      out.println(F("[CON] Scan failed — retrying once..."));
-      vTaskDelay(1000 / portTICK_PERIOD_MS);
+    int maxTries = 3;
+    int tryCount = 0;
+    bool found = false;
+    while (tryCount < maxTries && !found) {
+      out.printf("[CON] WiFi scan try %d...\n", tryCount + 1);
+      WiFi.disconnect(false);
+      vTaskDelay(300 / portTICK_PERIOD_MS);
+      out.println(F("[CON] Please wait ~3s..."));
       s_scan_count = WiFi.scanNetworks(false, true);
-    }
-    if (s_scan_count < 0) {
-      s_scan_count = 0;
-    }
-    if (s_scan_count == 0) {
-      out.println(F("[CON] No networks found."));
-    } else {
-      if (s_scan_count > 20) {
-        s_scan_count = 20;
+      if (s_scan_count > 0) {
+        found = true;
+        break;
       }
-      out.printf("[CON] Found %d network(s):\n", s_scan_count);
-      for (int i = 0; i < s_scan_count; i++) {
-        s_scan_ssid[i] = WiFi.SSID(i);
-        wifi_auth_mode_t auth = WiFi.encryptionType(i);
-        const char *authStr = "OPEN";
-        if (auth == WIFI_AUTH_WPA2_ENTERPRISE) {
-          authStr = "WPA2-ENT";
-        } else if (auth == WIFI_AUTH_WPA3_ENTERPRISE) {
-          authStr = "WPA3-ENT";
-        } else if (auth == WIFI_AUTH_WPA3_PSK) {
-          authStr = "WPA3";
-        } else if (auth == WIFI_AUTH_WPA2_PSK) {
-          authStr = "WPA2";
-        } else if (auth == WIFI_AUTH_WPA_WPA2_PSK) {
-          authStr = "WPA/WPA2";
-        } else if (auth == WIFI_AUTH_WPA_PSK) {
-          authStr = "WPA";
-        } else if (auth != WIFI_AUTH_OPEN) {
-          authStr = "OTHER";
-        }
-        out.printf("  [%2d] %-32s  %4d dBm  %-10s  ch%d\n",
-                   i + 1,
-                   WiFi.SSID(i).c_str(),
-                   WiFi.RSSI(i),
-                   authStr,
-                   WiFi.channel(i));
+      tryCount++;
+      if (s_scan_count == WIFI_SCAN_FAILED || s_scan_count < 0) {
+        out.println(F("[CON] Scan failed — retrying..."));
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
       }
-      out.println(F("[CON] Web UI: pick SSID from scan, or use: <n> norm pass:<pw> / <n> ent user:<id> pass:<pw>"));
     }
+    if (!found) {
+      out.println(F("[CON] No networks found after 3 tries. Waiting 5 minutes before next scan..."));
+      cctv_wifi_unlock();
+      vTaskDelay(300000 / portTICK_PERIOD_MS); // 5 minutes
+      // After 5 min, allow scan again (user can re-issue command)
+      return;
+    }
+    if (s_scan_count > 20) {
+      s_scan_count = 20;
+    }
+    out.printf("[CON] Found %d network(s):\n", s_scan_count);
+    for (int i = 0; i < s_scan_count; i++) {
+      s_scan_ssid[i] = WiFi.SSID(i);
+      wifi_auth_mode_t auth = WiFi.encryptionType(i);
+      const char *authStr = "OPEN";
+      if (auth == WIFI_AUTH_WPA2_ENTERPRISE) {
+        authStr = "WPA2-ENT";
+      } else if (auth == WIFI_AUTH_WPA3_ENTERPRISE) {
+        authStr = "WPA3-ENT";
+      } else if (auth == WIFI_AUTH_WPA3_PSK) {
+        authStr = "WPA3";
+      } else if (auth == WIFI_AUTH_WPA2_PSK) {
+        authStr = "WPA2";
+      } else if (auth == WIFI_AUTH_WPA_WPA2_PSK) {
+        authStr = "WPA/WPA2";
+      } else if (auth == WIFI_AUTH_WPA_PSK) {
+        authStr = "WPA";
+      } else if (auth != WIFI_AUTH_OPEN) {
+        authStr = "OTHER";
+      }
+      out.printf("  [%2d] %-32s  %4d dBm  %-10s  ch%d\n",
+                 i + 1,
+                 WiFi.SSID(i).c_str(),
+                 WiFi.RSSI(i),
+                 authStr,
+                 WiFi.channel(i));
+    }
+    out.println(F("[CON] Web UI: pick SSID from scan, or use: <n> norm pass:<pw> / <n> ent user:<id> pass:<pw>"));
     WiFi.scanDelete();
     cctv_wifi_unlock();
     return;

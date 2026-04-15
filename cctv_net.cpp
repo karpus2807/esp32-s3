@@ -38,35 +38,40 @@ static bool s_eth_started = false;
 static bool s_eth_mini_dhcp = false;
 static bool s_eth_mini_dhcp_unsupported = false;
 static bool s_eth_mini_dhcp_warned = false;
+static String s_eth_boot_log;  // captures ETH init messages for web diagnostics
+#define ETH_BLOG(fmt, ...) do { \
+  char _b[160]; snprintf(_b, sizeof(_b), fmt, ##__VA_ARGS__); \
+  s_eth_boot_log += _b; Serial.print(_b); \
+} while(0)
 
 static void eth_hw_reset_pulse() {
 #if CCTV_ETH_PIN_RST >= 0
   pinMode(CCTV_ETH_PIN_RST, OUTPUT);
   digitalWrite(CCTV_ETH_PIN_RST, LOW);
-  delay(5);
+  delay(50);
   digitalWrite(CCTV_ETH_PIN_RST, HIGH);
-  delay(20);
+  delay(200);
 #endif
 }
 
 static bool eth_begin_once(int32_t phy_addr, spi_host_device_t host) {
   eth_hw_reset_pulse();
-  return ETH.begin(
+    return ETH.begin(
     ETH_PHY_W5500,
     phy_addr,
     CCTV_ETH_PIN_CS,
-    -1,
-#if CCTV_ETH_PIN_RST >= 0
+    CCTV_ETH_PIN_INT, // INT pin for fast interrupt-driven LAN
+  #if CCTV_ETH_PIN_RST >= 0
     CCTV_ETH_PIN_RST,
-#else
+  #else
     -1,
-#endif
+  #endif
     host,
     CCTV_ETH_PIN_SCK,
     CCTV_ETH_PIN_MISO,
     CCTV_ETH_PIN_MOSI,
     CCTV_ETH_SPI_MHZ
-  );
+    );
 }
 #endif
 
@@ -81,7 +86,9 @@ void cctv_net_init_ethernet() {
     return;
   }
 
-  CETH_LOG(
+  s_eth_boot_log.reserve(512);
+
+  ETH_BLOG(
     "[ETH] W5500  CS=%d SCK=%d MOSI=%d MISO=%d  host=%d  %uMHz  phy=%d  RSTpin=%d\n",
     CCTV_ETH_PIN_CS,
     CCTV_ETH_PIN_SCK,
@@ -92,37 +99,197 @@ void cctv_net_init_ethernet() {
     CCTV_ETH_PHY_ADDR,
     CCTV_ETH_PIN_RST);
 
-  const struct {
+  /* -------- Pre-flight SPI probe -------- */
+  {
+    /* HW reset pulse first (if RST GPIO configured) */
+    eth_hw_reset_pulse();
+    delay(100);
+
+    auto spi_probe = [&](int mosi, int miso, int speed_hz, int spi_mode, const char *label) {
+      spi_bus_config_t buscfg = {};
+      buscfg.mosi_io_num = mosi;
+      buscfg.miso_io_num = miso;
+      buscfg.sclk_io_num = CCTV_ETH_PIN_SCK;
+      buscfg.quadwp_io_num = -1;
+      buscfg.quadhd_io_num = -1;
+      buscfg.max_transfer_sz = 64;
+
+      esp_err_t ret = spi_bus_initialize(CCTV_ETH_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+      if (ret != ESP_OK) {
+        ETH_BLOG("[DIAG:%s] bus_init FAIL 0x%x\n", label, ret);
+        return;
+      }
+
+      spi_device_handle_t spi;
+      spi_device_interface_config_t devcfg = {};
+      devcfg.clock_speed_hz = speed_hz;
+      devcfg.mode = spi_mode;
+      devcfg.spics_io_num = CCTV_ETH_PIN_CS;
+      devcfg.queue_size = 1;
+
+      ret = spi_bus_add_device(CCTV_ETH_SPI_HOST, &devcfg, &spi);
+      if (ret == ESP_OK) {
+        /* W5500 VERSIONR at 0x0039, common block, read VDM */
+        uint8_t tx[4] = {0x00, 0x39, 0x00, 0x00};
+        uint8_t rx[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        spi_transaction_t t = {};
+        t.length = 32;
+        t.tx_buffer = tx;
+        t.rx_buffer = rx;
+        ret = spi_device_transmit(spi, &t);
+        ETH_BLOG("[DIAG:%s] rx={%02X,%02X,%02X,%02X} (expect rx[3]=0x04)\n",
+                 label, rx[0], rx[1], rx[2], rx[3]);
+        spi_bus_remove_device(spi);
+      } else {
+        ETH_BLOG("[DIAG:%s] add_dev FAIL 0x%x\n", label, ret);
+      }
+      spi_bus_free(CCTV_ETH_SPI_HOST);
+    };
+
+    /* Try multiple configs: normal/swapped × mode0/mode3 × 1MHz */
+    spi_probe(CCTV_ETH_PIN_MOSI, CCTV_ETH_PIN_MISO, 1000000, 0, "1M_m0");
+    spi_probe(CCTV_ETH_PIN_MOSI, CCTV_ETH_PIN_MISO, 1000000, 3, "1M_m3");
+    spi_probe(CCTV_ETH_PIN_MISO, CCTV_ETH_PIN_MOSI, 1000000, 0, "swap_1M_m0");
+    spi_probe(CCTV_ETH_PIN_MISO, CCTV_ETH_PIN_MOSI, 1000000, 3, "swap_1M_m3");
+
+    /* Raw GPIO reads */
+    pinMode(CCTV_ETH_PIN_MISO, INPUT);
+    int miso_raw = digitalRead(CCTV_ETH_PIN_MISO);
+    pinMode(CCTV_ETH_PIN_MOSI, INPUT);
+    int mosi_raw = digitalRead(CCTV_ETH_PIN_MOSI);
+    ETH_BLOG("[DIAG] raw GPIO: MISO(%d)=%d  MOSI(%d)=%d\n",
+             CCTV_ETH_PIN_MISO, miso_raw, CCTV_ETH_PIN_MOSI, mosi_raw);
+
+    /* ---- Bit-bang SPI full trace (32 clocks, log every MISO bit) ---- */
+    {
+      pinMode(CCTV_ETH_PIN_CS, OUTPUT);
+      pinMode(CCTV_ETH_PIN_SCK, OUTPUT);
+      pinMode(CCTV_ETH_PIN_MOSI, OUTPUT);
+      pinMode(CCTV_ETH_PIN_MISO, INPUT);
+      digitalWrite(CCTV_ETH_PIN_CS, HIGH);
+      digitalWrite(CCTV_ETH_PIN_SCK, LOW);
+      delayMicroseconds(50);
+
+      int miso_pre = digitalRead(CCTV_ETH_PIN_MISO);
+
+      /* Assert CS */
+      digitalWrite(CCTV_ETH_PIN_CS, LOW);
+      delayMicroseconds(50);
+      int miso_cs = digitalRead(CCTV_ETH_PIN_MISO);
+
+      /* W5500 frame: 16-bit addr (0x0039) + 8-bit ctrl (0x00=read common VDM) + 8-bit dummy */
+      const uint8_t tx[4] = {0x00, 0x39, 0x00, 0x00};
+      uint8_t rx_bits[32]; // capture every MISO bit
+
+      for (int i = 0; i < 32; i++) {
+        int byte_idx = i / 8;
+        int bit_idx = 7 - (i % 8);
+        digitalWrite(CCTV_ETH_PIN_MOSI, (tx[byte_idx] >> bit_idx) & 1);
+        delayMicroseconds(10);
+        digitalWrite(CCTV_ETH_PIN_SCK, HIGH);
+        delayMicroseconds(10);
+        rx_bits[i] = digitalRead(CCTV_ETH_PIN_MISO);
+        digitalWrite(CCTV_ETH_PIN_SCK, LOW);
+        delayMicroseconds(5);
+      }
+      digitalWrite(CCTV_ETH_PIN_CS, HIGH);
+
+      /* Format: show all 32 MISO bits grouped by byte */
+      char trace[80];
+      snprintf(trace, sizeof(trace),
+        "%d%d%d%d%d%d%d%d %d%d%d%d%d%d%d%d %d%d%d%d%d%d%d%d %d%d%d%d%d%d%d%d",
+        rx_bits[0],rx_bits[1],rx_bits[2],rx_bits[3],rx_bits[4],rx_bits[5],rx_bits[6],rx_bits[7],
+        rx_bits[8],rx_bits[9],rx_bits[10],rx_bits[11],rx_bits[12],rx_bits[13],rx_bits[14],rx_bits[15],
+        rx_bits[16],rx_bits[17],rx_bits[18],rx_bits[19],rx_bits[20],rx_bits[21],rx_bits[22],rx_bits[23],
+        rx_bits[24],rx_bits[25],rx_bits[26],rx_bits[27],rx_bits[28],rx_bits[29],rx_bits[30],rx_bits[31]);
+
+      uint8_t ver = 0;
+      for (int i = 0; i < 8; i++) {
+        if (rx_bits[24 + i]) ver |= (1 << (7 - i));
+      }
+
+      ETH_BLOG("[BB] pre=%d cs=%d MISO: %s => ver=0x%02X\n", miso_pre, miso_cs, trace, ver);
+
+      /* Also clock 8 more bits to see if data comes late */
+      digitalWrite(CCTV_ETH_PIN_CS, LOW);
+      delayMicroseconds(50);
+      /* Re-send the same frame */
+      for (int i = 0; i < 32; i++) {
+        int byte_idx = i / 8;
+        int bit_idx = 7 - (i % 8);
+        digitalWrite(CCTV_ETH_PIN_MOSI, (tx[byte_idx] >> bit_idx) & 1);
+        delayMicroseconds(10);
+        digitalWrite(CCTV_ETH_PIN_SCK, HIGH);
+        delayMicroseconds(10);
+        rx_bits[i] = digitalRead(CCTV_ETH_PIN_MISO);
+        digitalWrite(CCTV_ETH_PIN_SCK, LOW);
+        delayMicroseconds(5);
+      }
+      /* Then 16 more dummy clocks */
+      uint8_t extra[16];
+      for (int i = 0; i < 16; i++) {
+        digitalWrite(CCTV_ETH_PIN_MOSI, 0);
+        delayMicroseconds(10);
+        digitalWrite(CCTV_ETH_PIN_SCK, HIGH);
+        delayMicroseconds(10);
+        extra[i] = digitalRead(CCTV_ETH_PIN_MISO);
+        digitalWrite(CCTV_ETH_PIN_SCK, LOW);
+        delayMicroseconds(5);
+      }
+      digitalWrite(CCTV_ETH_PIN_CS, HIGH);
+
+      uint8_t ver2 = 0;
+      for (int i = 0; i < 8; i++) {
+        if (rx_bits[24 + i]) ver2 |= (1 << (7 - i));
+      }
+      uint8_t ext1 = 0, ext2 = 0;
+      for (int i = 0; i < 8; i++) {
+        if (extra[i]) ext1 |= (1 << (7 - i));
+        if (extra[8+i]) ext2 |= (1 << (7 - i));
+      }
+      ETH_BLOG("[BB] 2nd: ver=0x%02X ext=0x%02X,0x%02X\n", ver2, ext1, ext2);
+
+      /* Check RST pin state */
+      int rst_state = digitalRead(CCTV_ETH_PIN_RST);
+      ETH_BLOG("[BB] RST(%d)=%d CS(%d) SCK(%d)\n",
+               CCTV_ETH_PIN_RST, rst_state,
+               CCTV_ETH_PIN_CS, CCTV_ETH_PIN_SCK);
+    }
+  }
+  /* -------- end pre-flight -------- */
+
+  struct EthTry {
     int32_t phy;
     spi_host_device_t host;
     const char *note;
-  } kTries[] = {
+  };
+  EthTry kTries[4] = {
     {CCTV_ETH_PHY_ADDR, CCTV_ETH_SPI_HOST, "default"},
     {1, CCTV_ETH_SPI_HOST, "phy=1"},
-#if (CCTV_ETH_SPI_HOST != SPI2_HOST)
     {CCTV_ETH_PHY_ADDR, SPI2_HOST, "SPI2_HOST"},
     {1, SPI2_HOST, "phy=1 SPI2_HOST"},
-#endif
   };
+  size_t nTries = (CCTV_ETH_SPI_HOST != SPI2_HOST) ? 4 : 2;
 
-  for (size_t i = 0; i < sizeof(kTries) / sizeof(kTries[0]); ++i) {
+  for (size_t i = 0; i < nTries; ++i) {
     if (s_eth_started) {
       break;
     }
     if (i > 0) {
-      CETH_LOG("[ETH] retry: %s\n", kTries[i].note);
+      ETH_BLOG("[ETH] retry: %s\n", kTries[i].note);
       ETH.end();
       delay(150);
     }
+    ETH_BLOG("[ETH] ETH.begin(%s) phy=%d host=%d ...\n", kTries[i].note, (int)kTries[i].phy, (int)kTries[i].host);
     s_eth_started = eth_begin_once(kTries[i].phy, kTries[i].host);
+    ETH_BLOG("[ETH] ETH.begin(%s) => %s\n", kTries[i].note, s_eth_started ? "OK" : "FAIL");
   }
 
   if (s_eth_started) {
-    CETH_LOG_LN(F("[ETH] Driver OK — plug RJ45 to router; link LED should blink on jack"));
+    ETH_BLOG("[ETH] Driver OK — plug RJ45 to router; link LED should blink on jack\n");
     cctv_eth_try_apply_static_from_nvs();
   } else {
-    CETH_LOG_LN(F("[ETH] FAILED all retries."));
-    CETH_LOG_LN(F("[ETH] Hardware: 3V3+GND common; CS/SCK/MOSI/MISO correct; RST must be HIGH (10k to 3V3 or wire GPIO41->RST)"));
+    ETH_BLOG("[ETH] FAILED all retries — check wiring: 3V3+GND common; CS/SCK/MOSI/MISO; RST HIGH (10k to 3V3)\n");
   }
 #endif
 }
@@ -420,6 +587,11 @@ void cctv_net_print_eth_diagnostics(Print &out) {
 #if CCTV_USE_ETH_W5500 && CONFIG_ETH_ENABLED
   if (!s_eth_started) {
     out.println(F("[ETH] Driver not started."));
+    if (s_eth_boot_log.length() > 0) {
+      out.println(F("--- ETH boot log ---"));
+      out.print(s_eth_boot_log);
+      out.println(F("--- end ---"));
+    }
     return;
   }
   const bool staticNv = cctv_eth_nvs_static_enabled();

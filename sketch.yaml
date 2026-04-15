@@ -4,4 +4,8 @@ profiles:
     fqbn: esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=custom,USBMode=hwcdc,CDCOnBoot=default,UploadMode=default,FlashMode=qio
     platforms:
       - platform: esp32:esp32 (3.3.7)
+    libraries:
+      - DHT sensor library for ESPx (1.19)
+      - U8g2 (2.35.30)
+      - PubSubClient (2.8)
 default_profile: esp32s3_eth

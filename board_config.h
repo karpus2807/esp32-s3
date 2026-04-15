@@ -93,7 +93,7 @@
 #define CCTV_USE_ETH_W5500 1
 #endif
 #ifndef CCTV_ETH_PIN_SCK
-#define CCTV_ETH_PIN_SCK 21
+#define CCTV_ETH_PIN_SCK 1     // GPIO 21 dead — permanently on GPIO 1
 #endif
 #ifndef CCTV_ETH_PIN_MOSI
 #define CCTV_ETH_PIN_MOSI 47
@@ -105,17 +105,21 @@
 #ifndef CCTV_ETH_PIN_CS
 #define CCTV_ETH_PIN_CS 14
 #endif
+// W5500 INT (interrupt) pin — connect to ESP32 for low-latency LAN
+#ifndef CCTV_ETH_PIN_INT
+#define CCTV_ETH_PIN_INT 45
+#endif
 // W5500 internal PHY: 0 on most modules; try 1 if link never comes (see Serial [ETH] lines).
 #ifndef CCTV_ETH_PHY_ADDR
 #define CCTV_ETH_PHY_ADDR 0
 #endif
 // Optional: GPIO tied to W5500 RST (active low). -1 = none. Many boards need RST high — use 10k to 3V3 or this pin.
 #ifndef CCTV_ETH_PIN_RST
-#define CCTV_ETH_PIN_RST (-1)
+#define CCTV_ETH_PIN_RST 3
 #endif
-// Dupont wires: 10–14 MHz is safer than 20.
+// W5500 max 33 MHz. Dupont wires unstable above 14. 25 caused 10% loss.
 #ifndef CCTV_ETH_SPI_MHZ
-#define CCTV_ETH_SPI_MHZ 12
+#define CCTV_ETH_SPI_MHZ 14
 #endif
 // First DHCP wait at boot (ms). Slow routers / STP may need 20–30s.
 #ifndef CCTV_ETH_DHCP_WAIT_MS
@@ -151,6 +155,42 @@
 // Ignored if CCTV_ENABLE_SERIAL_CONSOLE is 1 (one Serial reader only).
 #ifndef CCTV_ENABLE_ETH_SERIAL_MINI
 #define CCTV_ENABLE_ETH_SERIAL_MINI 1
+#endif
+
+// ─── Addon modules (v2.0) ───────────────────────────────────────────────
+// DHT11 temperature & humidity sensor
+#ifndef CCTV_DHT_PIN
+#define CCTV_DHT_PIN 42
+#endif
+#ifndef CCTV_DHT_READ_INTERVAL_MS
+#define CCTV_DHT_READ_INTERVAL_MS 5000
+#endif
+
+// PIR HC-SR501 motion sensor
+#ifndef CCTV_PIR_PIN
+#define CCTV_PIR_PIN 41
+#endif
+#ifndef CCTV_PIR_DEBOUNCE_MS
+#define CCTV_PIR_DEBOUNCE_MS 2000
+#endif
+
+// SH1106 128×64 OLED (I2C)
+#ifndef CCTV_OLED_SDA
+#define CCTV_OLED_SDA 1
+#endif
+#ifndef CCTV_OLED_SCL
+#define CCTV_OLED_SCL 45
+#endif
+
+// MQTT / ThingsBoard defaults
+#ifndef CCTV_MQTT_DEFAULT_SERVER
+#define CCTV_MQTT_DEFAULT_SERVER "thingsboard.ipserver.in"
+#endif
+#ifndef CCTV_MQTT_DEFAULT_PORT
+#define CCTV_MQTT_DEFAULT_PORT 1883
+#endif
+#ifndef CCTV_MQTT_DEFAULT_INTERVAL_S
+#define CCTV_MQTT_DEFAULT_INTERVAL_S 10
 #endif
 
 #endif  // BOARD_CONFIG_H

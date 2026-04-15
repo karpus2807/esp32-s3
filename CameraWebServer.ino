@@ -19,6 +19,15 @@
 #include "cctv_wifi_profiles.h"
 #include "cctv_time_sync.h"
 #include "cctv_web_control.h"
+#include "cctv_dht.h"
+#include "cctv_pir.h"
+#include "cctv_oled.h"
+#include "cctv_mqtt.h"
+#include "cctv_telemetry.h"
+// Library includes for Arduino CLI dependency resolution
+#include <DHTesp.h>
+#include <U8g2lib.h>
+#include <PubSubClient.h>
 #include <Preferences.h>
 #include "esp_heap_caps.h"
 #include <esp_task_wdt.h>
@@ -87,6 +96,7 @@ String   g_wifiIdentity    = "";      // EAP identity / LDAP username
 String   g_wifiEapPass     = "";      // EAP password (LDAP password)
 String   g_timeHttpUrl;                // world-clock HTTP (NVS key timeHttp); empty = disabled
 String   g_wifiStatus      = "Not connected";
+bool     g_wifiAutoConnect = true;     // true = auto-connect WiFi (default ON)
 // AP mode permanently disabled — WiFi setup via web dashboard (/wifi) or optional serial console
 
 bool g_sdReady = false;
@@ -177,6 +187,8 @@ static const char* wifiStatusStr(wl_status_t s) {
 }
 
 bool connectWifi(uint32_t timeoutMs) {
+    // Always load auto-connect flag from NVS (in case changed by user)
+    loadWifiAutoConnect();
   // Do NOT use WiFi.mode(WIFI_OFF) — it destroys the netif and causes
   // "netstack cb reg failed" (ESP_ERR_ESP_NETIF, 12308) on the next call.
   // Simply disconnect and stay in STA mode.
@@ -323,6 +335,21 @@ static void wifiStationBackgroundTask(void *) {
       g_wifiStatus = "Not connected \xe2\x80\x94 retry in ~12s";
       vTaskDelay(pdMS_TO_TICKS(12000));
     }
+  }
+}
+#include <Preferences.h>
+void saveWifiAutoConnect() {
+  Preferences prefs;
+  if (prefs.begin("cctv_wifi", false)) {
+    prefs.putBool("autoConnect", g_wifiAutoConnect);
+    prefs.end();
+  }
+}
+void loadWifiAutoConnect() {
+  Preferences prefs;
+  if (prefs.begin("cctv_wifi", true)) {
+    g_wifiAutoConnect = prefs.getBool("autoConnect", true);
+    prefs.end();
   }
 }
 #endif
@@ -1095,6 +1122,13 @@ void setup() {
   warmupCamera(4);
   g_cameraStatusMessage = "Sensor ready";
 
+  // ── v2.0 Addon modules: OLED, DHT, PIR, MQTT ─────────────────────────
+  // cctv_oled_init();           // DISABLED — GPIO 1 (SDA) temporarily used as ETH SCK
+  // cctv_oled_boot_animation(); // DISABLED
+  cctv_dht_init();              // DHT11 sensor + background read task
+  cctv_pir_init();              // PIR ISR on GPIO 41
+  cctv_mqtt_init();             // Load MQTT config from NVS
+
   loadWifiConfig();
   SDBGf("[BOOT] +%lums net: STA prep → Ethernet → short DHCP → HTTP → Wi‑Fi on core 1\n",
         (unsigned long)(millis() - g_bootMillis));
@@ -1151,6 +1185,11 @@ void setup() {
     Serial.println(F("[HTTP] FATAL: httpd_start failed — web UI unavailable (check heap / port 80)"));
     Serial.flush();
   }
+
+  // ── v2.0: start background tasks after HTTP is up ────────────────────
+  cctv_oled_start_task();       // OLED page-rotation on Core 1
+  cctv_mqtt_start_task();       // MQTT reconnect + telemetry push on Core 0
+
   {
     esp_timer_handle_t ntp_timer = nullptr;
     const esp_timer_create_args_t ntp_args = {

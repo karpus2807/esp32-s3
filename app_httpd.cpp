@@ -33,6 +33,11 @@
 #include "cctv_platform.h"
 #include "cctv_web_control.h"
 #include "cctv_ui_log.h"
+#include "cctv_dht.h"
+#include "cctv_pir.h"
+#include "cctv_oled.h"
+#include "cctv_mqtt.h"
+#include "cctv_telemetry.h"
 #include <stdlib.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -929,6 +934,88 @@ static esp_err_t api_logs_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json.c_str(), json.length());
 }
 
+// ────────── IoT / Sensors API ──────────────────────────────────────────────
+
+static esp_err_t iot_handler(httpd_req_t *req) {
+  // Returns live sensor data + config fields
+  const CctvMqttConfig &cfg = cctv_mqtt_config();
+  String json;
+  json.reserve(512);
+  json = "{";
+
+  // Live sensor data
+  if (cctv_dht_ok()) {
+    json += "\"temp\":";  json += String(cctv_dht_temperature(), 1);
+    json += ",\"hum\":";  json += String(cctv_dht_humidity(), 1);
+  } else {
+    json += "\"temp\":null,\"hum\":null";
+  }
+  json += ",\"dhtOk\":";       json += cctv_dht_ok() ? "true" : "false";
+  json += ",\"dhtStatus\":\""; json += cctv_dht_status_str(); json += "\"";
+  json += ",\"pirAlert\":";    json += cctv_pir_alert() ? "true" : "false";
+  json += ",\"pirAgeS\":";     json += String(cctv_pir_last_trigger_age_s());
+  json += ",\"alertLevel\":";  json += String(cctv_telemetry_alert_level());
+  json += ",\"mqttConnected\":"; json += cctv_mqtt_connected() ? "true" : "false";
+  json += ",\"mqttStatus\":\"";  json += cctv_mqtt_status_str(); json += "\"";
+  json += ",\"oledOk\":";     json += cctv_oled_ok() ? "true" : "false";
+  json += ",\"oledStatus\":\""; json += cctv_oled_status_str(); json += "\"";
+
+  // Config fields
+  json += ",\"server\":\"";   json += cfg.server; json += "\"";
+  json += ",\"port\":";       json += String(cfg.port);
+  json += ",\"token\":\"";    json += cfg.token; json += "\"";
+  json += ",\"deviceId\":\""; json += cfg.deviceId; json += "\"";
+  json += ",\"interval\":";   json += String(cfg.pushIntervalS);
+  json += ",\"warnTemp\":";   json += String(cfg.warnTemp, 1);
+  json += ",\"criticalTemp\":"; json += String(cfg.criticalTemp, 1);
+  json += ",\"alertTemp\":";  json += String(cfg.alertTemp, 1);
+
+  json += "}";
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json.c_str(), json.length());
+}
+
+static esp_err_t iot_save_handler(httpd_req_t *req) {
+  CctvMqttConfig &cfg = cctv_mqtt_config();
+  const size_t q_len = httpd_req_get_url_query_len(req) + 1;
+  if (q_len <= 1) {
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"msg\":\"no params\"}", -1);
+  }
+  char *qbuf = (char *)malloc(q_len);
+  if (!qbuf) {
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":false,\"msg\":\"alloc\"}", -1);
+  }
+  httpd_req_get_url_query_str(req, qbuf, q_len);
+
+  char val[128];
+  if (httpd_query_key_value(qbuf, "server", val, sizeof(val)) == ESP_OK)
+    strlcpy(cfg.server, val, sizeof(cfg.server));
+  if (httpd_query_key_value(qbuf, "port", val, sizeof(val)) == ESP_OK)
+    cfg.port = (uint16_t)atoi(val);
+  if (httpd_query_key_value(qbuf, "token", val, sizeof(val)) == ESP_OK)
+    strlcpy(cfg.token, val, sizeof(cfg.token));
+  if (httpd_query_key_value(qbuf, "deviceId", val, sizeof(val)) == ESP_OK)
+    strlcpy(cfg.deviceId, val, sizeof(cfg.deviceId));
+  if (httpd_query_key_value(qbuf, "interval", val, sizeof(val)) == ESP_OK)
+    cfg.pushIntervalS = (uint16_t)atoi(val);
+  if (httpd_query_key_value(qbuf, "warnTemp", val, sizeof(val)) == ESP_OK)
+    cfg.warnTemp = atof(val);
+  if (httpd_query_key_value(qbuf, "criticalTemp", val, sizeof(val)) == ESP_OK)
+    cfg.criticalTemp = atof(val);
+  if (httpd_query_key_value(qbuf, "alertTemp", val, sizeof(val)) == ESP_OK)
+    cfg.alertTemp = atof(val);
+
+  free(qbuf);
+  cctv_mqtt_save_config();
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, "{\"ok\":true}", -1);
+}
+
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1155,6 +1242,50 @@ button:hover{opacity:.82}
     <div id="devLogWrap" style="display:none;margin-top:10px">
       <div style="font-size:.75rem;color:#64748b;margin-bottom:4px">Session log</div>
       <pre id="devLogView" class="mono" style="background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px;font-size:.72rem;max-height:220px;overflow:auto;white-space:pre-wrap;color:#94a3b8"></pre>
+    </div>
+  </div>
+
+  <!-- IoT / Sensors -->
+  <div class="card" style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <h2 style="margin:0">&#127777; IoT &amp; Sensors</h2>
+      <button class="bn sm" onclick="togglePanel('iotPanel',loadIotConfig)">&#9881; Configure</button>
+    </div>
+    <div class="grid" style="margin-top:10px;margin-bottom:0">
+      <div>
+        <div class="row"><span class="lbl">Temperature</span><span id="iotTemp" style="font-weight:600">--</span></div>
+        <div class="row"><span class="lbl">Humidity</span><span id="iotHum" style="font-weight:600">--</span></div>
+        <div class="row"><span class="lbl">DHT Status</span><span id="iotDhtSt" class="badge y">--</span></div>
+      </div>
+      <div>
+        <div class="row"><span class="lbl">PIR Motion</span><span id="iotPir" class="badge y">--</span></div>
+        <div class="row"><span class="lbl">Alert Level</span><span id="iotAlert" class="badge y">--</span></div>
+        <div class="row"><span class="lbl">MQTT</span><span id="iotMqtt" class="badge y">--</span></div>
+      </div>
+    </div>
+    <div class="grid" style="margin-top:6px;margin-bottom:0">
+      <div>
+        <div class="row"><span class="lbl">OLED</span><span id="iotOled" class="badge y">--</span></div>
+      </div>
+      <div>
+        <div class="row"><span class="lbl">Last PIR</span><span id="iotPirAge" style="font-size:.78rem;color:#94a3b8">--</span></div>
+      </div>
+    </div>
+    <div id="iotPanel" style="display:none;margin-top:10px">
+      <div class="panel-grid">
+        <div><label class="inp-lbl">MQTT Server</label><input id="iotSrv" class="inp" type="text" placeholder="thingsboard.ipserver.in"></div>
+        <div><label class="inp-lbl">Port</label><input id="iotPort" class="inp" type="number" placeholder="1883"></div>
+        <div class="full"><label class="inp-lbl">Device Access Token</label><input id="iotTok" class="inp" type="text" placeholder="ThingsBoard device token"></div>
+        <div><label class="inp-lbl">Device ID</label><input id="iotDev" class="inp" type="text" placeholder="esp32-s3-cctv"></div>
+        <div><label class="inp-lbl">Push Interval (s)</label><input id="iotIntv" class="inp" type="number" placeholder="10"></div>
+        <div><label class="inp-lbl">Warn Temp (&deg;C)</label><input id="iotWarnT" class="inp" type="number" step="0.1" placeholder="40"></div>
+        <div><label class="inp-lbl">Critical Temp (&deg;C)</label><input id="iotCritT" class="inp" type="number" step="0.1" placeholder="50"></div>
+        <div><label class="inp-lbl">Alert Temp (&deg;C)</label><input id="iotAlrtT" class="inp" type="number" step="0.1" placeholder="35"></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="bw sm" onclick="saveIotConfig()">&#10003; Save IoT Config</button>
+      </div>
+      <div class="pnl-msg" id="iotMsg"></div>
     </div>
   </div>
 
@@ -1557,21 +1688,79 @@ function togglePreview(){
   }
 }
 
+// ── IoT / Sensors ──────────────────────────────────────────────────────────
+async function loadIotConfig(){
+  try{
+    const j=await fetch('/api/iot').then(r=>r.json());
+    if(j.server!==undefined) document.getElementById('iotSrv').value=j.server;
+    if(j.port!==undefined) document.getElementById('iotPort').value=j.port;
+    if(j.token!==undefined) document.getElementById('iotTok').value=j.token;
+    if(j.deviceId!==undefined) document.getElementById('iotDev').value=j.deviceId;
+    if(j.interval!==undefined) document.getElementById('iotIntv').value=j.interval;
+    if(j.warnTemp!==undefined) document.getElementById('iotWarnT').value=j.warnTemp;
+    if(j.criticalTemp!==undefined) document.getElementById('iotCritT').value=j.criticalTemp;
+    if(j.alertTemp!==undefined) document.getElementById('iotAlrtT').value=j.alertTemp;
+  }catch(e){}
+}
+async function saveIotConfig(){
+  const params=new URLSearchParams();
+  params.set('server',document.getElementById('iotSrv').value);
+  params.set('port',document.getElementById('iotPort').value);
+  params.set('token',document.getElementById('iotTok').value);
+  params.set('deviceId',document.getElementById('iotDev').value);
+  params.set('interval',document.getElementById('iotIntv').value);
+  params.set('warnTemp',document.getElementById('iotWarnT').value);
+  params.set('criticalTemp',document.getElementById('iotCritT').value);
+  params.set('alertTemp',document.getElementById('iotAlrtT').value);
+  try{
+    const r=await fetch('/api/iot/save?'+params.toString());
+    const j=await r.json();
+    document.getElementById('iotMsg').textContent=(j&&j.ok)?'Saved':'Error';
+    toast(j&&j.ok?'IoT config saved':'Save failed');
+  }catch(e){document.getElementById('iotMsg').textContent='Error: '+e.message;}
+}
+async function refreshIot(){
+  try{
+    const j=await fetch('/api/iot').then(r=>r.json());
+    const te=document.getElementById('iotTemp');
+    const he=document.getElementById('iotHum');
+    if(j.temp!==null&&j.temp!==undefined){te.textContent=j.temp.toFixed(1)+' \u00b0C';}else{te.textContent='--';}
+    if(j.hum!==null&&j.hum!==undefined){he.textContent=j.hum.toFixed(0)+' %';}else{he.textContent='--';}
+    const ds=document.getElementById('iotDhtSt');
+    ds.textContent=j.dhtStatus||'--';ds.className='badge '+(j.dhtOk?'g':'r');
+    const pe=document.getElementById('iotPir');
+    pe.textContent=j.pirAlert?'MOTION':'No motion';pe.className='badge '+(j.pirAlert?'r':'g');
+    const al=document.getElementById('iotAlert');
+    const alv=j.alertLevel||1;
+    al.textContent=alv>=3?'CRITICAL':alv>=2?'WARNING':'NORMAL';
+    al.className='badge '+(alv>=3?'r':alv>=2?'y':'g');
+    const mq=document.getElementById('iotMqtt');
+    mq.textContent=j.mqttConnected?'Connected':'Disconnected';mq.className='badge '+(j.mqttConnected?'g':'r');
+    const ol=document.getElementById('iotOled');
+    ol.textContent=j.oledOk?'OK':'N/A';ol.className='badge '+(j.oledOk?'g':'y');
+    const pa=document.getElementById('iotPirAge');
+    if(j.pirAgeS>0){pa.textContent=j.pirAgeS+'s ago';}else{pa.textContent='never';}
+  }catch(e){}
+}
+
 // ── Boot ───────────────────────────────────────────────────────────────────
 refreshStatus();
 loadFiles();
+refreshIot();
 window._statusIv=setInterval(refreshStatus,4000);
 window._filesIv=setInterval(loadFiles,30000);
+window._iotIv=setInterval(refreshIot,5000);
 // Pause polling when tab is hidden to save bandwidth + device CPU
 document.addEventListener('visibilitychange',function(){
   if(document.hidden){
-    clearInterval(window._statusIv);clearInterval(window._filesIv);
+    clearInterval(window._statusIv);clearInterval(window._filesIv);clearInterval(window._iotIv);
     if(window._devLogIv){clearInterval(window._devLogIv);window._devLogIv=null;}
     if(prevActive){togglePreview();}
   }else{
-    refreshStatus();loadFiles();
+    refreshStatus();loadFiles();refreshIot();
     window._statusIv=setInterval(refreshStatus,4000);
     window._filesIv=setInterval(loadFiles,30000);
+    window._iotIv=setInterval(refreshIot,5000);
   }
 });
 </script>
@@ -2297,12 +2486,38 @@ bool startCameraServer() {
 #endif
   };
 
+  httpd_uri_t iot_uri = {
+    .uri = "/api/iot",
+    .method = HTTP_GET,
+    .handler = iot_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    ,
+    .is_websocket = false,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+#endif
+  };
+
+  httpd_uri_t iot_save_uri = {
+    .uri = "/api/iot/save",
+    .method = HTTP_GET,
+    .handler = iot_save_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    ,
+    .is_websocket = false,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+#endif
+  };
+
   // Single HTTP server on port 80, Core 1
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   // Default CONFIG_HTTPD_MAX_URI_LEN is 512 — WiFi save uses GET with long URL-encoded
   // passwords; truncation caused silent save failures and broken JSON from the client.
   config.max_uri_len = 2048;
-  config.max_uri_handlers = 28;
+  config.max_uri_handlers = 30;
   config.max_open_sockets = 9;
   config.task_priority = tskIDLE_PRIORITY + 5;
   config.stack_size = 16384;     // download_handler + listCapturesJson need headroom
@@ -2341,6 +2556,8 @@ bool startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &reboot_uri);
     httpd_register_uri_handler(camera_httpd, &api_console_uri);
     httpd_register_uri_handler(camera_httpd, &api_logs_uri);
+    httpd_register_uri_handler(camera_httpd, &iot_uri);
+    httpd_register_uri_handler(camera_httpd, &iot_save_uri);
     return true;
   }
   Serial.printf("[HTTP] httpd_start FAILED (check port 80 in use / lwIP)\n");

@@ -179,6 +179,9 @@ Quick workflows
 
   A) First-time WiFi (after wifiscan):
        wifiscan
+       To disable auto-connect:autowifi off
+       To enable auto-connect: autowifi on
+       wifistatus
        2 norm pass:YourPassword
 
   B) Direct cable laptop ↔ board (no router): one command + laptop manual IP:

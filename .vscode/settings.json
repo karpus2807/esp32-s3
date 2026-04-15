@@ -1,3 +1,10 @@
 {
-    "C_Cpp.errorSquiggles": "enabled"
+    "C_Cpp.errorSquiggles": "Disabled",
+    "C_Cpp.intelliSenseEngine": "Disabled",
+    "files.associations": {
+        "*.ino": "cpp"
+    },
+    "clangd.arguments": [
+        "--query-driver=/home/hp/.arduino15/internal/esp32_esp-x32_2511_d9aabeac5bde9e01/bin/*"
+    ]
 }

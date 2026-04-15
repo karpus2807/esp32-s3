@@ -23,14 +23,7 @@ void cctv_pir_init() {
 
 bool cctv_pir_alert() { return s_alert; }
 
-void cctv_pir_clear_alert() { s_alert = false; }
-
 uint32_t cctv_pir_last_trigger_age_s() {
   if (s_lastTrigMs == 0) return 0;
   return (millis() - s_lastTrigMs) / 1000u;
-}
-
-const char* cctv_pir_status_str() {
-  if (!s_inited) return "Not initialised";
-  return s_alert ? "MOTION" : "OK";
 }

@@ -1,0 +1,43 @@
+CompileFlags:
+  # Arduino ESP32 toolchain uses GCC-only flags that clangd can't parse.
+  Remove:
+    - -mlongcalls
+    - -mdisable-hardware-atomics
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -std=gnu17
+    - -std=c17
+    - -std=gnu11
+    - -std=c11
+  # Force clangd to resolve headers as the ESP32 Xtensa toolchain.
+  Compiler: /home/hp/.arduino15/internal/esp32_esp-x32_2511_d9aabeac5bde9e01/bin/xtensa-esp32s3-elf-g++
+
+Diagnostics:
+  # Arduino .ino files are transformed by the build system and clangd often
+  # reports false-positive parse errors (missing String/WiFi.h, C-vs-C++).
+  # Keep editor clean; rely on arduino-cli compile for real errors.
+  Suppress: "*"
+
+---
+If:
+  PathMatch: .*\.ino
+CompileFlags:
+  Add:
+    - -x
+    - c++
+    - -std=gnu++17
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/cores/esp32
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/variants/esp32s3
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/WiFi/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/Network/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/FS/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/SD_MMC/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/Preferences/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/Ethernet/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/SPI/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/HTTPClient/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32_3.3.7_d11527a2071b9cce/libraries/NetworkClientSecure/src
+    - -I/home/hp/.arduino15/internal/esp32_esp32s3-libs_3.3.7_a47e78d52dc8886a/qio_opi/include
+    - -isystem
+    - /home/hp/.arduino15/internal/esp32_esp32s3-libs_3.3.7_a47e78d52dc8886a/include
+

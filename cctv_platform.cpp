@@ -42,3 +42,15 @@ bool cctv_wifi_try_lock(uint32_t timeout_ms) {
   if (!s_wifi_mtx) return true;
   return xSemaphoreTake(s_wifi_mtx, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
+
+const char *cctv_wifi_status_str(int wl_status) {
+  switch (wl_status) {
+    case 1:  return "SSID not found";   // WL_NO_SSID_AVAIL
+    case 4:  return "Wrong password";   // WL_CONNECT_FAILED
+    case 5:  return "Connection lost";  // WL_CONNECTION_LOST
+    case 6:  return "Disconnected";     // WL_DISCONNECTED
+    case 0:  return "Idle";             // WL_IDLE_STATUS
+    case 3:  return "Connected";        // WL_CONNECTED
+    default: return "Unknown";
+  }
+}

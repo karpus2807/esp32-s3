@@ -251,6 +251,13 @@ void cctv_wifi_delete_slot(uint8_t slot) {
   cctv_wifi_commit_all_slots_to_nvs();
 }
 
+bool cctv_wifi_slot_has_profile(uint8_t slot) {
+  if (slot > 2u) {
+    return false;
+  }
+  return s_slots[slot].ssid.length() > 0;
+}
+
 uint8_t cctv_wifi_preferred_slot() {
   return s_pref;
 }
@@ -263,6 +270,7 @@ void cctv_wifi_set_preferred_slot(uint8_t slot) {
 }
 
 bool cctv_wifi_try_connect_profiles(uint32_t timeout_per_slot_ms) {
+  extern volatile bool g_wifiScanRequested;
   uint8_t order[3];
   uint8_t n = 0;
   order[n++] = s_pref;
@@ -272,6 +280,7 @@ bool cctv_wifi_try_connect_profiles(uint32_t timeout_per_slot_ms) {
     }
   }
   for (uint8_t k = 0; k < 3; ++k) {
+    if (g_wifiScanRequested) return false;
     const uint8_t idx = order[k];
     if (s_slots[idx].ssid.length() == 0) {
       continue;

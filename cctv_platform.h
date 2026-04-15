@@ -19,6 +19,9 @@ void cctv_wifi_lock(void);
 void cctv_wifi_unlock(void);
 bool cctv_wifi_try_lock(uint32_t timeout_ms);
 
+// Human-readable WiFi status (shared — avoids duplicating in every file).
+const char *cctv_wifi_status_str(int wl_status);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3,7 +3,6 @@
 #include "cctv_dht.h"
 #include "cctv_pir.h"
 #include "cctv_mqtt.h"
-#include "cctv_oled.h"
 #include "cctv_net.h"
 #include "board_config.h"
 #include <WiFi.h>

@@ -9,6 +9,8 @@
 
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_eap_client.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -50,24 +52,6 @@ static void apply_eth_static_addrs(Print &out,
 #endif
 }
 
-static const char *wifi_status_str(wl_status_t s) {
-  switch (s) {
-    case WL_NO_SSID_AVAIL:
-      return "SSID not found";
-    case WL_CONNECT_FAILED:
-      return "Wrong password";
-    case WL_CONNECTION_LOST:
-      return "Connection lost";
-    case WL_DISCONNECTED:
-      return "Disconnected";
-    case WL_IDLE_STATUS:
-      return "Idle";
-    case WL_CONNECTED:
-      return "Connected";
-    default:
-      return "Unknown";
-  }
-}
 
 static String s_scan_ssid[20];
 static int s_scan_count = 0;
@@ -91,31 +75,41 @@ void cctv_web_control_dispatch(const String &line, Print &out) {
     return;
   }
   if (line.equalsIgnoreCase("wifiscan")) {
-    cctv_wifi_lock();
-    int maxTries = 3;
-    int tryCount = 0;
+    if (!cctv_wifi_try_lock(12000)) {
+      out.println(F("[CON] WiFi busy (lock timeout) — try again"));
+      return;
+    }
+    WiFi.scanDelete();
+    WiFi.disconnect(false, true);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    (void)esp_wifi_sta_enterprise_disable();
+    if (WiFi.getMode() != WIFI_STA) {
+      WiFi.mode(WIFI_STA);
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     bool found = false;
-    while (tryCount < maxTries && !found) {
-      out.printf("[CON] WiFi scan try %d...\n", tryCount + 1);
-      WiFi.disconnect(false);
-      vTaskDelay(300 / portTICK_PERIOD_MS);
-      out.println(F("[CON] Please wait ~3s..."));
-      s_scan_count = WiFi.scanNetworks(false, true);
-      if (s_scan_count > 0) {
-        found = true;
-        break;
+    for (int t = 0; t < 2; ++t) {
+      out.printf("[CON] WiFi scan try %d...\n", t + 1);
+      WiFi.scanDelete();
+      WiFi.scanNetworks(true, true);  // async
+      uint32_t deadline = millis() + 8000;
+      int16_t result = WIFI_SCAN_RUNNING;
+      while (millis() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(150));
+        result = WiFi.scanComplete();
+        if (result >= 0 || result == WIFI_SCAN_FAILED) break;
       }
-      tryCount++;
-      if (s_scan_count == WIFI_SCAN_FAILED || s_scan_count < 0) {
-        out.println(F("[CON] Scan failed — retrying..."));
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-      }
+      s_scan_count = (result > 0) ? result : 0;
+      if (s_scan_count > 0) { found = true; break; }
+      WiFi.scanDelete();
+      vTaskDelay(pdMS_TO_TICKS(500));
     }
     if (!found) {
-      out.println(F("[CON] No networks found after 3 tries. Waiting 5 minutes before next scan..."));
+      out.println(F("[CON] No networks found after 3 tries."));
       cctv_wifi_unlock();
-      vTaskDelay(300000 / portTICK_PERIOD_MS); // 5 minutes
-      // After 5 min, allow scan again (user can re-issue command)
       return;
     }
     if (s_scan_count > 20) {
@@ -155,15 +149,23 @@ void cctv_web_control_dispatch(const String &line, Print &out) {
   }
 
   if (line.equalsIgnoreCase("wifistatus")) {
-    out.printf("[WiFi] Status: %s\n", g_wifiStatus.c_str());
-    out.printf("[WiFi] State:  %s (%d)\n", wifi_status_str(WiFi.status()), (int)WiFi.status());
+    extern volatile bool g_wifiRetryExhausted;
+    out.printf("[WiFi] Status:  %s\n", g_wifiStatus.c_str());
+    out.printf("[WiFi] Driver:  %s (%d)\n", cctv_wifi_status_str(WiFi.status()), (int)WiFi.status());
+    out.printf("[WiFi] Mode:    %d (1=STA)\n", (int)WiFi.getMode());
+    out.printf("[WiFi] AutoConnect: %s  RetryDone: %s\n",
+               g_wifiAutoConnect ? "ON" : "OFF",
+               g_wifiRetryExhausted ? "YES (idle)" : "NO (active)");
     if (WiFi.status() == WL_CONNECTED) {
-      out.printf("[WiFi] IP: %s  RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      out.printf("[WiFi] IP: %s  RSSI: %d dBm  Ch: %d\n",
+                 WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
     }
-    out.printf("[ETH] link=%s dhcp=%s  primary IP: %s\n",
+    out.printf("[ETH]  link=%s dhcp=%s  IP: %s\n",
                cctv_eth_link_up() ? "up" : "down",
                cctv_eth_has_ip() ? "yes" : "no",
                cctv_primary_local_ip().toString().c_str());
+    out.printf("[Heap] Free: %u  PSRAM: %u\n",
+               (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     return;
   }
 

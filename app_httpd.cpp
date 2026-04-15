@@ -21,6 +21,8 @@
 #include "esp32-hal-ledc.h"
 #include <Arduino.h>
 #include <WiFi.h>
+#include "esp_wifi.h"
+#include "esp_eap_client.h"
 
 #include "cctv_net.h"
 #include "cctv_wifi_profiles.h"
@@ -35,13 +37,14 @@
 #include "cctv_ui_log.h"
 #include "cctv_dht.h"
 #include "cctv_pir.h"
-#include "cctv_oled.h"
 #include "cctv_mqtt.h"
 #include "cctv_telemetry.h"
 #include <stdlib.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/tcp.h>
+#include <stdarg.h>
+#include <Preferences.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -72,6 +75,7 @@ extern bool g_wifiEnterprise;
 extern String g_wifiIdentity;
 extern String g_wifiEapPass;
 extern String g_wifiStatus;
+extern volatile bool g_wifiScanRequested;
 bool saveJpegFrameToSd(String *savedPath = nullptr);
 bool saveJpegBufferToSd(const uint8_t *jpegBuf, size_t jpegLen, String *savedPath = nullptr);
 bool remountMicroSD();
@@ -80,6 +84,11 @@ size_t clearCaptures(String *message = nullptr);
 String listCapturesJson(size_t limit = 20);
 void saveWifiConfig();
 void clearWifiConfig();
+void loadWifiConfig();
+
+static String s_auth_user = "admin";
+static String s_auth_pass = "admin";
+static String s_auth_session;
 
 // URL-decode a query-parameter value (%XX → char, + → space)
 // ESP-IDF httpd_query_key_value() does NOT url-decode automatically.
@@ -100,6 +109,81 @@ static String urlDecode(const char *src) {
   return out;
 }
 
+static void cctv_auth_load_creds() {
+  Preferences p;
+  if (!p.begin("cctv_auth", true)) {
+    return;
+  }
+  const String u = p.getString("user", "admin");
+  const String pw = p.getString("pass", "admin");
+  p.end();
+  s_auth_user = u.length() ? u : "admin";
+  s_auth_pass = pw.length() ? pw : "admin";
+}
+
+static void cctv_auth_save_creds() {
+  Preferences p;
+  if (!p.begin("cctv_auth", false)) {
+    return;
+  }
+  p.putString("user", s_auth_user);
+  p.putString("pass", s_auth_pass);
+  p.end();
+}
+
+static bool cctv_auth_cookie_session_valid(httpd_req_t *req) {
+  if (s_auth_session.length() == 0) {
+    return false;
+  }
+  char cookie[256] = {0};
+  if (httpd_req_get_hdr_value_str(req, "Cookie", cookie, sizeof(cookie)) != ESP_OK) {
+    return false;
+  }
+  const String ck(cookie);
+  const String token = String("CTVSESSID=") + s_auth_session;
+  return ck.indexOf(token) >= 0;
+}
+
+static esp_err_t cctv_auth_send_unauthorized(httpd_req_t *req) {
+  if (req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_status(req, "401 Unauthorized");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"unauthorized\"}");
+  }
+  return ESP_FAIL;
+}
+
+static bool cctv_auth_require(httpd_req_t *req) {
+  if (cctv_auth_cookie_session_valid(req)) {
+    return true;
+  }
+  cctv_auth_send_unauthorized(req);
+  return false;
+}
+
+
+static void ui_debug_logf(const char *fmt, ...) {
+  if (!cctv_ui_log_get()) {
+    return;
+  }
+  char body[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(body, sizeof(body), fmt, ap);
+  va_end(ap);
+  String line;
+  line.reserve(strlen(body) + 28);
+  line += "[";
+  line += String(millis());
+  line += "ms] ";
+  line += body;
+  if (line.length() == 0 || line[line.length() - 1] != '\n') {
+    line += "\n";
+  }
+  cctv_ui_log_append(line);
+}
+
 
 
 httpd_handle_t camera_httpd = NULL;
@@ -116,6 +200,7 @@ void enable_led(bool en) {
 #endif
 
 static esp_err_t bmp_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
@@ -170,6 +255,7 @@ static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_
 }
 
 static esp_err_t capture_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
@@ -293,6 +379,7 @@ static float stream_fps_get() {
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   tune_stream_socket(req);
 
   esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
@@ -438,6 +525,7 @@ static esp_err_t parse_get(httpd_req_t *req, char **obuf) {
 }
 
 static esp_err_t cmd_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
   char variable[32];
   char value[32];
@@ -532,6 +620,7 @@ static int print_reg(char *p, sensor_t *s, uint16_t reg, uint32_t mask) {
 }
 
 static esp_err_t status_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   static char json_response[1280];
 
   sensor_t *s = esp_camera_sensor_get();
@@ -607,6 +696,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
 }
 
 static esp_err_t xclk_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
   char _xclk[32];
 
@@ -634,6 +724,7 @@ static esp_err_t xclk_handler(httpd_req_t *req) {
 }
 
 static esp_err_t reg_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
   char _reg[32];
   char _mask[32];
@@ -666,6 +757,7 @@ static esp_err_t reg_handler(httpd_req_t *req) {
 }
 
 static esp_err_t greg_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
   char _reg[32];
   char _mask[32];
@@ -704,6 +796,7 @@ static int parse_get_var(char *buf, const char *key, int def) {
 }
 
 static esp_err_t pll_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
 
   if (parse_get(req, &buf) != ESP_OK) {
@@ -732,6 +825,7 @@ static esp_err_t pll_handler(httpd_req_t *req) {
 }
 
 static esp_err_t win_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
 
   if (parse_get(req, &buf) != ESP_OK) {
@@ -767,6 +861,7 @@ static esp_err_t win_handler(httpd_req_t *req) {
 }
 
 static esp_err_t save_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   String savedPath;
   bool ok = saveJpegFrameToSd(&savedPath);
 
@@ -784,6 +879,7 @@ static esp_err_t save_handler(httpd_req_t *req) {
 }
 
 static esp_err_t storage_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
   String action;
   String actionMessage = g_sdStatusMessage;
@@ -863,6 +959,7 @@ class CctvLinePrint : public Print {
 };
 
 static esp_err_t api_console_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   if (httpd_req_get_url_query_len(req) < 1) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "cmd query required");
     return ESP_FAIL;
@@ -881,6 +978,22 @@ static esp_err_t api_console_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
   free(buf);
+  // URL-decode the cmd value (%20 → space, + → space, %XX → char)
+  {
+    char *r = cmd, *w = cmd;
+    while (*r) {
+      if (*r == '%' && r[1] && r[2]) {
+        char hex[3] = { r[1], r[2], 0 };
+        *w++ = (char)strtol(hex, nullptr, 16);
+        r += 3;
+      } else if (*r == '+') {
+        *w++ = ' '; r++;
+      } else {
+        *w++ = *r++;
+      }
+    }
+    *w = '\0';
+  }
   String line = String(cmd);
   line.trim();
   if (line.length() == 0) {
@@ -908,6 +1021,7 @@ static esp_err_t api_console_handler(httpd_req_t *req) {
 }
 
 static esp_err_t api_logs_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   if (httpd_req_get_url_query_len(req) > 0) {
     const size_t q_len = httpd_req_get_url_query_len(req) + 1;
     char *qbuf = (char *)malloc(q_len);
@@ -937,6 +1051,7 @@ static esp_err_t api_logs_handler(httpd_req_t *req) {
 // ────────── IoT / Sensors API ──────────────────────────────────────────────
 
 static esp_err_t iot_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   // Returns live sensor data + config fields
   const CctvMqttConfig &cfg = cctv_mqtt_config();
   String json;
@@ -957,8 +1072,6 @@ static esp_err_t iot_handler(httpd_req_t *req) {
   json += ",\"alertLevel\":";  json += String(cctv_telemetry_alert_level());
   json += ",\"mqttConnected\":"; json += cctv_mqtt_connected() ? "true" : "false";
   json += ",\"mqttStatus\":\"";  json += cctv_mqtt_status_str(); json += "\"";
-  json += ",\"oledOk\":";     json += cctv_oled_ok() ? "true" : "false";
-  json += ",\"oledStatus\":\""; json += cctv_oled_status_str(); json += "\"";
 
   // Config fields
   json += ",\"server\":\"";   json += cfg.server; json += "\"";
@@ -977,6 +1090,7 @@ static esp_err_t iot_handler(httpd_req_t *req) {
 }
 
 static esp_err_t iot_save_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   CctvMqttConfig &cfg = cctv_mqtt_config();
   const size_t q_len = httpd_req_get_url_query_len(req) + 1;
   if (q_len <= 1) {
@@ -1016,7 +1130,115 @@ static esp_err_t iot_save_handler(httpd_req_t *req) {
   return httpd_resp_send(req, "{\"ok\":true}", -1);
 }
 
+static esp_err_t auth_status_handler(httpd_req_t *req) {
+  const bool ok = cctv_auth_cookie_session_valid(req);
+  String j = "{\"ok\":true,\"loggedIn\":";
+  j += ok ? "true" : "false";
+  j += ",\"user\":\"";
+  append_json_escaped(j, s_auth_user);
+  j += "\"}";
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, j.c_str(), j.length());
+}
+
+static esp_err_t auth_login_handler(httpd_req_t *req) {
+  char *buf = nullptr;
+  if (parse_get(req, &buf) != ESP_OK) {
+    return ESP_FAIL;
+  }
+  char u[96] = {0};
+  char p[128] = {0};
+  if (httpd_query_key_value(buf, "u", u, sizeof(u)) != ESP_OK ||
+      httpd_query_key_value(buf, "p", p, sizeof(p)) != ESP_OK) {
+    free(buf);
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"missing credentials\"}");
+  }
+  const String user = urlDecode(u);
+  const String pass = urlDecode(p);
+  free(buf);
+  if (user != s_auth_user || pass != s_auth_pass) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_status(req, "401 Unauthorized");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid user/password\"}");
+  }
+
+  char sid[40];
+  snprintf(sid, sizeof(sid), "%08lx%08lx%08lx",
+           (unsigned long)esp_random(),
+           (unsigned long)esp_random(),
+           (unsigned long)millis());
+  s_auth_session = sid;
+  String ck = "CTVSESSID=" + s_auth_session + "; Path=/; HttpOnly; SameSite=Lax";
+  httpd_resp_set_hdr(req, "Set-Cookie", ck.c_str());
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t auth_logout_handler(httpd_req_t *req) {
+  s_auth_session = "";
+  httpd_resp_set_hdr(req, "Set-Cookie", "CTVSESSID=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t auth_change_password_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) {
+    return ESP_FAIL;
+  }
+  char *buf = nullptr;
+  if (parse_get(req, &buf) != ESP_OK) {
+    return ESP_FAIL;
+  }
+  char oldp[128] = {0};
+  char newp[128] = {0};
+  if (httpd_query_key_value(buf, "old", oldp, sizeof(oldp)) != ESP_OK ||
+      httpd_query_key_value(buf, "newp", newp, sizeof(newp)) != ESP_OK) {
+    free(buf);
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"old/new required\"}");
+  }
+  const String oldPass = urlDecode(oldp);
+  const String newPass = urlDecode(newp);
+  free(buf);
+  if (oldPass != s_auth_pass) {
+    httpd_resp_set_status(req, "401 Unauthorized");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"old password mismatch\"}");
+  }
+  if (newPass.length() < 4) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"new password too short\"}");
+  }
+  s_auth_pass = newPass;
+  cctv_auth_save_creds();
+  return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 static esp_err_t index_handler(httpd_req_t *req) {
+  if (!cctv_auth_cookie_session_valid(req)) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    static const char *login_html = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Device Login</title>
+<style>body{margin:0;background:#0f172a;color:#e2e8f0;font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}
+.c{width:min(92vw,360px);background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px}
+h1{font-size:1rem;margin:0 0 10px 0}.i{width:100%;padding:10px;margin:6px 0;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px}
+button{width:100%;padding:10px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-weight:700;cursor:pointer}
+#m{font-size:.82rem;color:#fca5a5;min-height:18px;margin-top:8px}</style></head><body>
+<div class="c"><h1>ESP32 CCTV Login</h1><input id="u" class="i" value="admin" placeholder="Username"><input id="p" class="i" type="password" placeholder="Password">
+<button onclick="go()">Login</button><div id="m"></div></div>
+<script>async function go(){const u=document.getElementById('u').value.trim();const p=document.getElementById('p').value;
+const m=document.getElementById('m');m.textContent='';if(!u||!p){m.textContent='Enter username/password';return;}
+try{const r=await fetch('/api/auth/login?u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p));const j=await r.json();
+if(j&&j.ok){location.href='/';}else{m.textContent=(j&&j.error)?j.error:'Login failed';}}catch(e){m.textContent='Error: '+e.message;}}</script>
+</body></html>)rawliteral";
+    return httpd_resp_sendstr(req, login_html);
+  }
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1080,6 +1302,10 @@ button:hover{opacity:.82}
 <body>
 <div class="c">
   <h1>&#128247; ESP32-S3 CCTV Recorder</h1>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px">
+    <button class="bn sm" onclick="authChangePass()">Change Password</button>
+    <button class="bd sm" onclick="authLogout()">Logout</button>
+  </div>
   <div id="deviceClockRow" style="margin-bottom:10px;padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:8px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
     <span style="font-size:.72rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.06em">Device time</span>
     <span id="deviceClock" class="mono" style="font-size:1.05rem;font-weight:700;color:#7dd3fc">--</span>
@@ -1113,6 +1339,8 @@ button:hover{opacity:.82}
       <div class="row"><span class="lbl">SD card</span><span id="sdBadge" class="badge y">-</span></div>
       <div class="row"><span class="lbl">Free / Total</span><span id="sdSpace" style="font-weight:600">-</span></div>
       <div class="row"><span class="lbl">WiFi</span><span id="wifiBadge" class="badge y">-</span></div>
+      <div class="row"><span class="lbl">Clock</span><span id="timeBadge" class="badge y">-</span></div>
+      <div class="row"><span class="lbl">Device Time</span><span id="deviceTime" style="font-size:.82rem;color:#94a3b8">-</span></div>
     </div>
   </div>
 
@@ -1155,7 +1383,10 @@ button:hover{opacity:.82}
   <div class="card" style="margin-bottom:12px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
       <h2 style="margin:0">&#128246; WiFi</h2>
-      <button class="bn sm" onclick="togglePanel('wifiPanel',loadWifiConfig)">&#9881; Configure</button>
+      <div style="display:flex;gap:6px">
+        <button class="bn sm" id="wifiOnOffBtn" onclick="toggleWifiRadio()">WiFi ON</button>
+        <button class="bn sm" onclick="togglePanel('wifiPanel',loadWifiConfig)">&#9881; Configure</button>
+      </div>
     </div>
     <div id="wifiStatusRow" style="font-size:.8rem;color:#94a3b8;margin-top:4px">-</div>
     <div id="wifiPanel" style="display:none;margin-top:10px">
@@ -1245,6 +1476,18 @@ button:hover{opacity:.82}
     </div>
   </div>
 
+  <!-- Live debug (actual backend diagnostics) -->
+  <div class="card" style="margin-bottom:12px">
+    <h2 style="margin-bottom:6px">&#128295; Live Debug</h2>
+    <p style="font-size:.78rem;color:#94a3b8;margin:0 0 8px 0">Shows real backend responses (scan/connect/profile switch/console) with timestamps.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+      <button type="button" class="bn sm" id="dbgPauseBtn" onclick="dbgTogglePause()">Start</button>
+      <button type="button" class="bd sm" onclick="dbgClear()">Clear</button>
+      <span id="dbgState" style="font-size:.75rem;color:#64748b">Off</span>
+    </div>
+    <pre id="dbgOut" class="mono" style="margin-top:0;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px;font-size:.72rem;max-height:220px;overflow:auto;white-space:pre-wrap;color:#cbd5e1"></pre>
+  </div>
+
   <!-- IoT / Sensors -->
   <div class="card" style="margin-bottom:12px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
@@ -1265,7 +1508,6 @@ button:hover{opacity:.82}
     </div>
     <div class="grid" style="margin-top:6px;margin-bottom:0">
       <div>
-        <div class="row"><span class="lbl">OLED</span><span id="iotOled" class="badge y">--</span></div>
       </div>
       <div>
         <div class="row"><span class="lbl">Last PIR</span><span id="iotPirAge" style="font-size:.78rem;color:#94a3b8">--</span></div>
@@ -1305,6 +1547,24 @@ button:hover{opacity:.82}
 function toast(m,d=3000){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),d);}
 function fmtSz(b){if(b>=1073741824)return(b/1073741824).toFixed(1)+' GB';if(b>=1048576)return(b/1048576).toFixed(1)+' MB';if(b>=1024)return(b/1024).toFixed(1)+' KB';return b+' B';}
 
+async function authLogout(){
+  try{await fetch('/api/auth/logout');}catch(e){}
+  location.href='/';
+}
+async function authChangePass(){
+  const oldp=prompt('Current password:');
+  if(oldp===null)return;
+  const newp=prompt('New password (min 4 chars):');
+  if(newp===null)return;
+  if(newp.length<4){toast('Password too short');return;}
+  try{
+    const r=await fetch('/api/auth/change?old='+encodeURIComponent(oldp)+'&newp='+encodeURIComponent(newp));
+    const j=await r.json();
+    if(j&&j.ok){toast('Password updated');}
+    else toast((j&&j.error)?j.error:'Password update failed');
+  }catch(e){toast('Error: '+e.message);}
+}
+
 async function devQuick(c){document.getElementById('devCmdIn').value=c;await devRun();}
 async function devRun(){
   const cmd=document.getElementById('devCmdIn').value.trim();
@@ -1341,6 +1601,42 @@ async function devLogClear(){
   await fetch('/api/logs?clear=1');
   await devLogRefresh();
   toast('Log cleared');
+}
+
+let dbgPaused=true;
+let dbgTimer=null;
+async function dbgRefresh(){
+  if(dbgPaused) return;
+  try{
+    const j=await fetch('/api/logs').then(r=>r.json());
+    const out=document.getElementById('dbgOut');
+    out.textContent=(j&&j.text)?j.text:'';
+    out.scrollTop=out.scrollHeight;
+  }catch(e){}
+}
+async function dbgTogglePause(){
+  dbgPaused=!dbgPaused;
+  const b=document.getElementById('dbgPauseBtn');
+  const s=document.getElementById('dbgState');
+  if(dbgPaused){
+    b.textContent='Start';
+    s.textContent='Off';
+    try{ await fetch('/api/logs?enable=0'); }catch(e){}
+    if(dbgTimer){clearInterval(dbgTimer);dbgTimer=null;}
+  }else{
+    b.textContent='Pause';
+    s.textContent='Live';
+    try{ await fetch('/api/logs?enable=1'); }catch(e){}
+    dbgRefresh();
+    if(!dbgTimer) dbgTimer=setInterval(dbgRefresh,2500);
+  }
+}
+async function dbgClear(){
+  try{
+    await fetch('/api/logs?clear=1');
+    await dbgRefresh();
+    toast('Debug cleared');
+  }catch(e){toast('Error: '+e.message);}
 }
 
 (function(){
@@ -1393,6 +1689,14 @@ async function refreshStatus(){
     else{wb.textContent=ws.length>22?ws.slice(0,22)+'\u2026':ws||'-';wb.className='badge y';}
     document.getElementById('wifiStatusRow').textContent=ws;
 
+    // WiFi ON/OFF button state
+    const wBtn=document.getElementById('wifiOnOffBtn');
+    if(wBtn){
+      const acOff=ws.includes('auto-connect OFF');
+      wBtn.textContent=acOff?'WiFi ON':'WiFi OFF';
+      wBtn.className=acOff?'bn sm':'bd sm';
+    }
+
     // Network URLs (HTTP only) — same UI on LAN or Wi\u2011Fi
     let netHtml='';
     if(location.protocol!=='http:'){
@@ -1414,6 +1718,20 @@ async function refreshStatus(){
     if(dc && sysinfo.deviceTime!==undefined){
       dc.textContent=sysinfo.deviceTime;
       dc.style.color=sysinfo.timeOk?'#7dd3fc':'#f87171';
+    }
+
+    // Time sync badge
+    const tb=document.getElementById('timeBadge');
+    const dt=document.getElementById('deviceTime');
+    if(tb){
+      if(sysinfo.timeSynced){
+        tb.textContent='\u2714 Synced';tb.className='badge g';
+      }else{
+        tb.textContent='\u2717 Not synced';tb.className='badge r';
+      }
+    }
+    if(dt && sysinfo.deviceTime!==undefined){
+      dt.textContent=sysinfo.deviceTime;
     }
 
     // CPU
@@ -1465,14 +1783,28 @@ function renderWifiProfiles(w){
     const ssid=(p.ssid!=null&&String(p.ssid).length)?String(p.ssid):'(empty)';
     const pref=p.pref?'<span style="color:#4ade80;margin-left:6px">preferred</span>':'';
     const kind=p.enterprise?'EAP':'WPA';
-    const delBtn=(p.ssid!=null&&String(p.ssid).length)
+    const hasSsid=(p.ssid!=null&&String(p.ssid).length);
+    const delBtn=hasSsid
       ? '<button type="button" class="bd sm" onclick="deleteWifiSlot('+p.slot+')">Delete</button>'
+      : '';
+    const swBtn=hasSsid
+      ? '<button type="button" class="bp sm" onclick="switchWifiSlot('+p.slot+')">Switch</button>'
       : '';
     h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #1e293b">'+
       '<span><b>#'+(p.slot+1)+'</b> <span class="mono">'+ssid.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</span>'+pref+
-      ' <span style="color:#64748b">'+kind+'</span></span>'+delBtn+'</div>';
+      ' <span style="color:#64748b">'+kind+'</span></span>'+
+      '<span style="display:flex;gap:6px">'+swBtn+delBtn+'</span></div>';
   }
   el.innerHTML=h;
+}
+async function switchWifiSlot(slot){
+  try{
+    const w=await fetch('/wifi?useslot='+encodeURIComponent(slot)+'&reconnect=1').then(r=>r.json());
+    const m=w.msg||('Switching to saved profile slot '+(slot+1));
+    document.getElementById('wifiMsg').textContent=m;
+    toast(m);
+    await loadWifiConfig();
+  }catch(e){ toast('Error: '+e.message); }
 }
 async function deleteWifiSlot(slot){
   if(!confirm('Delete saved Wi\u2011Fi profile slot '+(slot+1)+'?')) return;
@@ -1540,7 +1872,16 @@ async function scanWifi(){
   res.innerHTML='<div style="padding:8px;color:#64748b">Scanning... please wait ~5s</div>';
   row.style.display='block';
   try{
-    const nets=await fetch('/wifiscan').then(r=>r.json());
+    const data=await fetch('/wifiscan').then(r=>r.json());
+    const nets=Array.isArray(data)?data:(data.nets||[]);
+    if(data && data.diag){
+      const d=data.diag;
+      const st='scanCode='+(d.scanCode!==undefined?d.scanCode:'-')+
+        ' wl='+(d.wlText||d.wl||'-')+
+        ' mode='+(d.mode!==undefined?d.mode:'-')+
+        ' rssi='+(d.rssi!==undefined?d.rssi:'-');
+      document.getElementById('wifiMsg').textContent='Scan diag: '+st;
+    }
     if(!nets||nets.length===0){
       res.innerHTML='<div style="padding:8px;color:#64748b">No networks found. Check antenna.</div>';
     } else {
@@ -1584,6 +1925,20 @@ async function clearWifiCfg(){
     toast('WiFi config cleared');
     await loadWifiConfig();
   }catch(e){document.getElementById('wifiMsg').textContent='Error: '+e.message;}
+}
+
+async function toggleWifiRadio(){
+  const btn=document.getElementById('wifiOnOffBtn');
+  const isOn=btn.textContent.includes('OFF');
+  const cmd=isOn?'autowifi off':'autowifi on';
+  try{
+    const r=await fetch('/api/console?cmd='+encodeURIComponent(cmd));
+    const j=await r.json();
+    toast(j.out||cmd);
+    btn.textContent=isOn?'WiFi ON':'WiFi OFF';
+    btn.className=isOn?'bn sm':'bd sm';
+    refreshStatus();
+  }catch(e){ toast('Error: '+e.message); }
 }
 
 async function rebootDevice(){
@@ -1736,8 +2091,6 @@ async function refreshIot(){
     al.className='badge '+(alv>=3?'r':alv>=2?'y':'g');
     const mq=document.getElementById('iotMqtt');
     mq.textContent=j.mqttConnected?'Connected':'Disconnected';mq.className='badge '+(j.mqttConnected?'g':'r');
-    const ol=document.getElementById('iotOled');
-    ol.textContent=j.oledOk?'OK':'N/A';ol.className='badge '+(j.oledOk?'g':'y');
     const pa=document.getElementById('iotPirAge');
     if(j.pirAgeS>0){pa.textContent=j.pirAgeS+'s ago';}else{pa.textContent='never';}
   }catch(e){}
@@ -1754,6 +2107,7 @@ window._iotIv=setInterval(refreshIot,5000);
 document.addEventListener('visibilitychange',function(){
   if(document.hidden){
     clearInterval(window._statusIv);clearInterval(window._filesIv);clearInterval(window._iotIv);
+    if(dbgTimer){clearInterval(dbgTimer);dbgTimer=null;}
     if(window._devLogIv){clearInterval(window._devLogIv);window._devLogIv=null;}
     if(prevActive){togglePreview();}
   }else{
@@ -1761,6 +2115,7 @@ document.addEventListener('visibilitychange',function(){
     window._statusIv=setInterval(refreshStatus,4000);
     window._filesIv=setInterval(loadFiles,30000);
     window._iotIv=setInterval(refreshIot,5000);
+    if(!dbgPaused && !dbgTimer) dbgTimer=setInterval(dbgRefresh,2500);
   }
 });
 </script>
@@ -1784,6 +2139,7 @@ static bool isValidFilename(const char *name) {
 }
 
 static esp_err_t files_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   String json = listCapturesJson(50);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1791,6 +2147,7 @@ static esp_err_t files_handler(httpd_req_t *req) {
 }
 
 static esp_err_t download_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
   char fname[64] = {0};
   if (parse_get(req, &buf) != ESP_OK) return ESP_FAIL;
@@ -1881,6 +2238,7 @@ static esp_err_t download_handler(httpd_req_t *req) {
 }
 
 static esp_err_t delete_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
   char fname[64] = {0};
   if (parse_get(req, &buf) != ESP_OK) return ESP_FAIL;
@@ -1905,29 +2263,90 @@ static esp_err_t delete_handler(httpd_req_t *req) {
 // GET /wifiscan  → scan networks async (non-blocking), return JSON array
 // Uses WIFI_SCAN_RUNNING / WIFI_SCAN_DONE pattern to avoid blocking httpd task
 static esp_err_t wifiscan_handler(httpd_req_t *req) {
-  // Acquire WiFi lock so scan doesn't collide with background connect task
-  if (!cctv_wifi_try_lock(500)) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
+
+  g_wifiScanRequested = true;
+  const uint32_t t0 = millis();
+  ui_debug_logf("[WiFiScan] start wl=%d (%s) mode=%d",
+                (int)WiFi.status(), cctv_wifi_status_str(WiFi.status()),
+                (int)WiFi.getMode());
+
+  if (!cctv_wifi_try_lock(12000)) {
+    g_wifiScanRequested = false;
+    ui_debug_logf("[WiFiScan] lock timeout %lu ms", (unsigned long)(millis() - t0));
+    const char *fail = "{\"nets\":[],\"diag\":{\"ok\":false,\"reason\":\"wifi lock timeout\"}}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_sendstr(req, "[]");
+    return httpd_resp_send(req, fail, strlen(fail));
   }
+
+  // Safe cleanup: disconnect(false,true) = radio ON rakhte hue stored SSID erase karo.
+  // disconnect(true) GALAT hai — woh radio OFF kar deta hai!
   WiFi.scanDelete();
-  vTaskDelay(50 / portTICK_PERIOD_MS);
+  WiFi.disconnect(false, true);
+  vTaskDelay(pdMS_TO_TICKS(150));
+  (void)esp_wifi_sta_enterprise_disable();
 
-  // Start async scan (works while associated; may pause traffic briefly)
-  int n = WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true);
-  // Poll for up to 5s without yielding control for multi-second blocks
-  const uint32_t scanStart = millis();
-  while (n == WIFI_SCAN_RUNNING && (millis() - scanStart) < 5000) {
-    vTaskDelay(200 / portTICK_PERIOD_MS);  // yield for 200ms slices
-    n = WiFi.scanComplete();
+  if (WiFi.getMode() != WIFI_STA) {
+    WiFi.mode(WIFI_STA);
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
-  if (n < 0) n = 0;
-  cctv_wifi_unlock();
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  vTaskDelay(pdMS_TO_TICKS(100));
 
-  String resp = "[";
+  ui_debug_logf("[WiFiScan] ready wl=%d (%s) mode=%d heap=%u",
+                (int)WiFi.status(), cctv_wifi_status_str(WiFi.status()),
+                (int)WiFi.getMode(), (unsigned)ESP.getFreeHeap());
+
+  uint16_t apCount = 0;
+  esp_err_t scanErr = ESP_OK;
+  uint8_t triesUsed = 0;
+
+  // Async scan — start karo, poll karo, timeout se safe hai
+  for (uint8_t t = 0; t < 2; ++t) {
+    triesUsed = (uint8_t)(t + 1);
+    WiFi.scanDelete();
+
+    WiFi.scanNetworks(true, true);  // async=true, show_hidden=true
+    ui_debug_logf("[WiFiScan] try=%u async started", (unsigned)triesUsed);
+
+    const uint32_t deadline = millis() + 8000;
+    int16_t result = WIFI_SCAN_RUNNING;
+    while (millis() < deadline) {
+      vTaskDelay(pdMS_TO_TICKS(150));
+      result = WiFi.scanComplete();
+      if (result >= 0 || result == WIFI_SCAN_FAILED) break;
+    }
+    ui_debug_logf("[WiFiScan] try=%u result=%d wl=%d elapsed=%lu",
+                  (unsigned)triesUsed, (int)result, (int)WiFi.status(),
+                  (unsigned long)(millis() - t0));
+    if (result > 0) {
+      apCount = (uint16_t)result;
+      scanErr = ESP_OK;
+      break;
+    }
+    scanErr = (result == WIFI_SCAN_FAILED) ? ESP_FAIL : ESP_OK;
+    WiFi.scanDelete();
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  int n = (int)apCount;
+  cctv_wifi_unlock();
+  g_wifiScanRequested = false;
+
+  // Reset background retry so it can try profiles again after user scans
+  extern volatile bool g_wifiRetryExhausted;
+  g_wifiRetryExhausted = false;
+
+  Serial.printf("[WiFiScan] done nets=%d tries=%u %lums err=%s\n",
+                n, (unsigned)triesUsed, (unsigned long)(millis() - t0),
+                esp_err_to_name(scanErr));
+
+  String resp;
+  resp.reserve(128 + n * 80);
+  resp = "{\"nets\":[";
   for (int i = 0; i < n; i++) {
-    if (i > 0) resp += ",";
+    if (i > 0) resp += ',';
     wifi_auth_mode_t auth = WiFi.encryptionType(i);
     const char *authStr = "OPEN";
     if      (auth == WIFI_AUTH_WPA2_ENTERPRISE) authStr = "WPA2-ENT";
@@ -1937,14 +2356,26 @@ static esp_err_t wifiscan_handler(httpd_req_t *req) {
     else if (auth == WIFI_AUTH_WPA_WPA2_PSK)    authStr = "WPA/WPA2";
     else if (auth == WIFI_AUTH_WPA_PSK)         authStr = "WPA";
     else if (auth != WIFI_AUTH_OPEN)            authStr = "OTHER";
-    // Escape SSID for JSON
     String ssid = WiFi.SSID(i);
     ssid.replace("\\", "\\\\"); ssid.replace("\"", "\\\"");
     resp += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
             ",\"auth\":\"" + authStr + "\",\"ch\":" + String(WiFi.channel(i)) + "}";
   }
-  resp += "]";
   WiFi.scanDelete();
+
+  resp += "],\"diag\":{\"ok\":true,\"tries\":";
+  resp += String((unsigned)triesUsed);
+  resp += ",\"err\":\"";
+  resp += esp_err_to_name(scanErr);
+  resp += "\",\"apCount\":";
+  resp += String((unsigned)apCount);
+  resp += ",\"ms\":";
+  resp += String((unsigned long)(millis() - t0));
+  resp += ",\"wl\":";
+  resp += String((int)WiFi.status());
+  resp += ",\"connected\":";
+  resp += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
+  resp += "}}";
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1953,6 +2384,7 @@ static esp_err_t wifiscan_handler(httpd_req_t *req) {
 
 // GET /sysinfo → heap, PSRAM, CPU usage (idle task watermarks as proxy)
 static esp_err_t sysinfo_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   // Heap
   size_t heapFree  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
   size_t heapTotal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
@@ -1980,8 +2412,8 @@ static esp_err_t sysinfo_handler(httpd_req_t *req) {
   // (low watermark = task used heavily = high load)
   // Use a simple heuristic: report 0 unless we get real data
   UBaseType_t idle0Wm = 0, idle1Wm = 0;
-  TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
-  TaskHandle_t idle1 = xTaskGetIdleTaskHandleForCPU(1);
+  TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCore(0);
+  TaskHandle_t idle1 = xTaskGetIdleTaskHandleForCore(1);
   if (idle0) idle0Wm = uxTaskGetStackHighWaterMark(idle0);
   if (idle1) idle1Wm = uxTaskGetStackHighWaterMark(idle1);
   // idle stack is typically 768 words; lower watermark → less idle time → higher load
@@ -2010,6 +2442,8 @@ static esp_err_t sysinfo_handler(httpd_req_t *req) {
   }
   resp += "\",\"timeOk\":";
   resp += t_ok ? "true" : "false";
+  resp += ",\"timeSynced\":";
+  resp += cctv_wall_clock_sane() ? "true" : "false";
   resp += "}";
 
   httpd_resp_set_type(req, "application/json");
@@ -2019,6 +2453,7 @@ static esp_err_t sysinfo_handler(httpd_req_t *req) {
 
 // GET /reboot  → immediate reboot (no WiFi check)
 static esp_err_t reboot_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"Rebooting...\"}");
@@ -2037,7 +2472,9 @@ static esp_err_t reboot_handler(httpd_req_t *req) {
 // GET /wifi?clear=1                    → clear all saved WiFi profiles
 // GET /wifi?delslot=0..2               → delete one profile slot
 static esp_err_t wifi_handler(httpd_req_t *req) {
+  if (!cctv_auth_require(req)) return ESP_FAIL;
   char *buf = NULL;
+  String opMsg;
   if (httpd_req_get_url_query_len(req) > 0 && parse_get(req, &buf) == ESP_OK) {
     char tsmall[24] = {0};
     char qssid[160] = {0};
@@ -2046,6 +2483,7 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
     char qep[384] = {0};
     bool doReconnect = false;
     bool only_delslot = false;
+    bool only_useslot = false;
     bool skip_save = false;
 
     // Clear WiFi config
@@ -2055,6 +2493,7 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
       clearWifiConfig();
       g_wifiStatus = "Not connected";
       cctv_wifi_unlock();
+      ui_debug_logf("[WiFiCfg] clear requested from UI");
       httpd_resp_set_type(req, "application/json");
       httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
       return httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"WiFi config cleared\"}");
@@ -2072,11 +2511,30 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
         cctv_wifi_apply_preferred_or_first_globals();
         only_delslot = true;
         skip_save = true;
+        ui_debug_logf("[WiFiCfg] deleted profile slot=%d", ds);
       }
     }
 
     if (httpd_query_key_value(buf, "reconnect", tsmall, sizeof(tsmall) - 1) == ESP_OK && atoi(tsmall))
       doReconnect = true;
+
+    if (httpd_query_key_value(buf, "useslot", tsmall, sizeof(tsmall) - 1) == ESP_OK &&
+        strlen(tsmall) > 0) {
+      only_useslot = true;
+      skip_save = true;
+      doReconnect = false;
+      const int us = atoi(tsmall);
+      if (us >= 0 && us <= 2 && cctv_wifi_slot_has_profile((uint8_t)us)) {
+        cctv_wifi_apply_slot_to_globals((uint8_t)us);
+        cctv_wifi_set_preferred_slot((uint8_t)us);
+        doReconnect = true;  // switching profile should reconnect to selected one.
+        opMsg = "Switched to saved profile slot " + String(us + 1);
+        ui_debug_logf("[WiFiCfg] switched to slot=%d ssid='%s' reconnect=yes", us, g_wifiSsid.c_str());
+      } else {
+        opMsg = "Invalid/empty profile slot";
+        ui_debug_logf("[WiFiCfg] switch rejected (invalid/empty slot input='%s')", tsmall);
+      }
+    }
 
     int saveSlot = -1;
     if (!only_delslot && httpd_query_key_value(buf, "slot", tsmall, sizeof(tsmall) - 1) == ESP_OK) {
@@ -2086,7 +2544,7 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
       }
     }
 
-    if (!only_delslot) {
+    if (!only_delslot && !only_useslot) {
       if (httpd_query_key_value(buf, "ssid", qssid, sizeof(qssid) - 1) == ESP_OK)
         g_wifiSsid = urlDecode(qssid);
       if (httpd_query_key_value(buf, "pass", qpass, sizeof(qpass) - 1) == ESP_OK && strlen(qpass) > 0)
@@ -2111,14 +2569,26 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
         cctv_wifi_save_globals_into_slot((uint8_t)saveSlot);
         cctv_wifi_set_preferred_slot((uint8_t)saveSlot);
         log_i("[WiFi] NVS profile saved slot=%d ssid_len=%u", saveSlot, (unsigned)g_wifiSsid.length());
+        ui_debug_logf("[WiFiCfg] saved profile slot=%d ssid='%s' ent=%s reconnect=%s",
+                      saveSlot, g_wifiSsid.c_str(), g_wifiEnterprise ? "yes" : "no",
+                      doReconnect ? "yes" : "no");
       } else {
         saveWifiConfig();
+        if (g_wifiSsid.length() > 0) {
+          ui_debug_logf("[WiFiCfg] saved profile auto-slot ssid='%s' ent=%s reconnect=%s",
+                        g_wifiSsid.c_str(), g_wifiEnterprise ? "yes" : "no",
+                        doReconnect ? "yes" : "no");
+        }
       }
     }
     cctv_wifi_unlock();
 
+    // Naya profile save hua — background task ko wapas try karne do
+    { extern volatile bool g_wifiRetryExhausted; g_wifiRetryExhausted = false; }
+
     if (doReconnect) {
       g_wifiStatus = "Reconnecting...";
+      ui_debug_logf("[WiFiCfg] reconnect task scheduled");
       xTaskCreate([](void*){
         vTaskDelay(600 / portTICK_PERIOD_MS);
         cctv_wifi_lock();
@@ -2127,9 +2597,13 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
         if (ok) {
           g_wifiStatus = "Connected: " + WiFi.localIP().toString();
           log_i("[WiFi] Connected %s (no reboot)", WiFi.localIP().toString().c_str());
+          ui_debug_logf("[WiFiCfg] reconnect success ip=%s rssi=%d",
+                        WiFi.localIP().toString().c_str(), WiFi.RSSI());
           cctv_time_kick_sync_if_needed(true);
         } else {
           g_wifiStatus = "Failed: " + String(WiFi.status());
+          ui_debug_logf("[WiFiCfg] reconnect failed wl=%d (%s)",
+                        (int)WiFi.status(), cctv_wifi_status_str(WiFi.status()));
         }
         vTaskDelete(NULL);
       }, "WifiRC", 6144, NULL, 2, NULL);
@@ -2168,6 +2642,9 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
   resp += "\"ethIp\":\"" + ethIp + "\",";
   resp += "\"wifiIp\":\"" + wfIp + "\",";
   resp += "\"ethLink\":" + String(cctv_eth_link_up() ? "true" : "false");
+  resp += ",\"msg\":\"";
+  append_json_escaped(resp, opMsg);
+  resp += "\"";
   resp += ",\"prefSlot\":" + String((unsigned)cctv_wifi_preferred_slot());
   resp += ",\"profiles\":" + cctv_wifi_profiles_json_array();
   resp += "}";
@@ -2486,6 +2963,58 @@ bool startCameraServer() {
 #endif
   };
 
+  httpd_uri_t auth_status_uri = {
+    .uri = "/api/auth/status",
+    .method = HTTP_GET,
+    .handler = auth_status_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    ,
+    .is_websocket = false,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+#endif
+  };
+
+  httpd_uri_t auth_login_uri = {
+    .uri = "/api/auth/login",
+    .method = HTTP_GET,
+    .handler = auth_login_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    ,
+    .is_websocket = false,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+#endif
+  };
+
+  httpd_uri_t auth_logout_uri = {
+    .uri = "/api/auth/logout",
+    .method = HTTP_GET,
+    .handler = auth_logout_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    ,
+    .is_websocket = false,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+#endif
+  };
+
+  httpd_uri_t auth_change_uri = {
+    .uri = "/api/auth/change",
+    .method = HTTP_GET,
+    .handler = auth_change_password_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    ,
+    .is_websocket = false,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+#endif
+  };
+
   httpd_uri_t iot_uri = {
     .uri = "/api/iot",
     .method = HTTP_GET,
@@ -2531,6 +3060,7 @@ bool startCameraServer() {
   log_i("Starting CCTV web server on port %d", config.server_port);
   if (httpd_start(&camera_httpd, &config) == ESP_OK) {
     cctv_ui_log_init();
+    cctv_auth_load_creds();
     Serial.printf("[HTTP] httpd_start OK  port=%d  core=%d\n", config.server_port, (int)config.core_id);
     httpd_register_uri_handler(camera_httpd, &index_uri);
     httpd_register_uri_handler(camera_httpd, &cmd_uri);
@@ -2556,6 +3086,10 @@ bool startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &reboot_uri);
     httpd_register_uri_handler(camera_httpd, &api_console_uri);
     httpd_register_uri_handler(camera_httpd, &api_logs_uri);
+    httpd_register_uri_handler(camera_httpd, &auth_status_uri);
+    httpd_register_uri_handler(camera_httpd, &auth_login_uri);
+    httpd_register_uri_handler(camera_httpd, &auth_logout_uri);
+    httpd_register_uri_handler(camera_httpd, &auth_change_uri);
     httpd_register_uri_handler(camera_httpd, &iot_uri);
     httpd_register_uri_handler(camera_httpd, &iot_save_uri);
     return true;

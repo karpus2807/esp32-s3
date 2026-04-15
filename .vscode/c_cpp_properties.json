@@ -194,11 +194,9 @@
                 "CONFIG_ETH_ENABLED=1",
                 "CONFIG_IDF_TARGET_ESP32S3=1"
             ],
-            "compilerPath": "/home/hp/.arduino15/packages/esp32/tools/esp-x32/2601/bin/xtensa-esp-elf-gcc",
-            "cStandard": "gnu17",
+            "compilerPath": "/home/hp/.arduino15/internal/esp32_esp-x32_2511_d9aabeac5bde9e01/bin/xtensa-esp32s3-elf-g++",
             "cppStandard": "gnu++17",
-            "intelliSenseMode": "gcc-x86",
-            "compileCommands": "${workspaceFolder}/compile_commands.json"
+            "intelliSenseMode": "linux-gcc-x64"
         }
     ],
     "version": 4

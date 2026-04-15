@@ -184,14 +184,6 @@
 #define CCTV_PIR_DEBOUNCE_MS 2000
 #endif
 
-// SH1106 128×64 OLED (I2C)
-#ifndef CCTV_OLED_SDA
-#define CCTV_OLED_SDA 1
-#endif
-#ifndef CCTV_OLED_SCL
-#define CCTV_OLED_SCL 45
-#endif
-
 // MQTT / ThingsBoard defaults
 #ifndef CCTV_MQTT_DEFAULT_SERVER
 #define CCTV_MQTT_DEFAULT_SERVER "thingsboard.ipserver.in"

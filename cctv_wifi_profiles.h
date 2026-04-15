@@ -31,6 +31,7 @@ uint8_t cctv_wifi_preferred_slot();
 void cctv_wifi_set_preferred_slot(uint8_t slot);
 
 void cctv_wifi_delete_slot(uint8_t slot);
+bool cctv_wifi_slot_has_profile(uint8_t slot);
 
 // For GET /wifi JSON extension: [{slot,ssid,enterprise,hasPass,hasEap},...]
 String cctv_wifi_profiles_json_array();

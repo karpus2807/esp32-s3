@@ -21,12 +21,10 @@
 #include "cctv_web_control.h"
 #include "cctv_dht.h"
 #include "cctv_pir.h"
-#include "cctv_oled.h"
 #include "cctv_mqtt.h"
 #include "cctv_telemetry.h"
 // Library includes for Arduino CLI dependency resolution
 #include <DHTesp.h>
-#include <U8g2lib.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include "esp_heap_caps.h"
@@ -97,6 +95,7 @@ String   g_wifiEapPass     = "";      // EAP password (LDAP password)
 String   g_timeHttpUrl;                // world-clock HTTP (NVS key timeHttp); empty = disabled
 String   g_wifiStatus      = "Not connected";
 bool     g_wifiAutoConnect = true;     // true = auto-connect WiFi (default ON)
+volatile bool g_wifiScanRequested = false;
 // AP mode permanently disabled — WiFi setup via web dashboard (/wifi) or optional serial console
 
 bool g_sdReady = false;
@@ -112,8 +111,9 @@ uint8_t g_sdInitAttempts = 0;
 uint8_t g_sdInitFailures = 0;
 
 namespace {
-const char *kNtpServer = "pool.ntp.org";
-const char *kTimezone = "IST-5:30";
+const char *kNtpServer1  = "pool.ntp.org";
+const char *kNtpServer2  = "time.google.com";
+const char *kTimezone    = "IST-5:30";
 uint32_t g_fileCounter = 0;
 uint32_t g_lastAutoSaveMs = 0;
 uint32_t g_bootMillis = 0;
@@ -174,17 +174,6 @@ static void warmupCamera(uint8_t frames) {
 #endif
 }
 
-static const char* wifiStatusStr(wl_status_t s) {
-  switch(s) {
-    case WL_NO_SSID_AVAIL:   return "SSID not found";
-    case WL_CONNECT_FAILED:  return "Wrong password";
-    case WL_CONNECTION_LOST: return "Connection lost";
-    case WL_DISCONNECTED:    return "Disconnected";
-    case WL_IDLE_STATUS:     return "Idle";
-    case WL_CONNECTED:       return "Connected";
-    default:                 return "Unknown";
-  }
-}
 
 bool connectWifi(uint32_t timeoutMs) {
     // Always load auto-connect flag from NVS (in case changed by user)
@@ -251,10 +240,15 @@ bool connectWifi(uint32_t timeoutMs) {
   wl_status_t lastStatus = WL_IDLE_STATUS;
   uint32_t dotCount = 0;
   while (millis() - start < timeoutMs) {
+    if (g_wifiScanRequested) {
+      g_wifiStatus = "Scan requested";
+      WiFi.disconnect(false);
+      break;
+    }
     wl_status_t st = WiFi.status();
     if (st != lastStatus) {
       SDBGf("\n[WiFi] Status → %s (%d)  [%lu ms]\n",
-            wifiStatusStr(st), (int)st, (unsigned long)(millis() - start));
+            cctv_wifi_status_str(st), (int)st, (unsigned long)(millis() - start));
       lastStatus = st;
     }
     if (st == WL_CONNECTED) break;
@@ -267,7 +261,7 @@ bool connectWifi(uint32_t timeoutMs) {
     vTaskDelay(pdMS_TO_TICKS(200));
     if (++dotCount % 10 == 0)
       SDBGf("[WiFi] ... %lu ms elapsed, status=%s\n",
-            (unsigned long)(millis() - start), wifiStatusStr(WiFi.status()));
+            (unsigned long)(millis() - start), cctv_wifi_status_str(WiFi.status()));
     else
       SDBGf(".");
   }
@@ -293,9 +287,15 @@ bool connectWifi(uint32_t timeoutMs) {
     cctv_net_apply_fallback_dns();
     cctv_time_kick_sync_if_needed(true);
   } else {
-    g_wifiStatus = String("Failed: ") + wifiStatusStr(WiFi.status());
+    // Clean up driver state so the radio is idle after a failed attempt.
+    // disconnect(false, true) = radio ON, erase stored AP config.
+    WiFi.disconnect(false, true);
+    delay(100);
+    (void)esp_wifi_sta_enterprise_disable();
+
+    g_wifiStatus = String("Failed: ") + cctv_wifi_status_str(WiFi.status());
     SDBGf("[WiFi] FAIL  final status: %s (%d)  elapsed: %lu ms\n",
-          wifiStatusStr(WiFi.status()), (int)WiFi.status(),
+          cctv_wifi_status_str(WiFi.status()), (int)WiFi.status(),
           (unsigned long)(millis() - start));
     if (g_wifiEnterprise) {
       SDBGln(F("[WiFi] Enterprise hint: verify SSID really uses WPA2/WPA3-Enterprise and account is enabled for this SSID."));
@@ -308,32 +308,76 @@ bool connectWifi(uint32_t timeoutMs) {
 // Runs on Core 1 so setup()/HTTP bring-up on the other path is not blocked by multi-slot STA
 // attempts (each can take many seconds). LAN users get the web UI as soon as Ethernet DHCP
 // completes within CCTV_ETH_BOOT_DHCP_WAIT_MS.
+static const uint8_t WIFI_MAX_TRIES   = 3;
+static const uint32_t WIFI_COOLDOWN_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+volatile bool g_wifiRetryExhausted = false;
+
 static void wifiStationBackgroundTask(void *) {
   vTaskDelay(pdMS_TO_TICKS(400));
+  uint8_t tries = 0;
+
   for (;;) {
+    if (g_wifiScanRequested) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+    loadWifiAutoConnect();
+    if (!g_wifiAutoConnect) {
+      g_wifiStatus = "WiFi auto-connect OFF";
+      tries = 0;
+      vTaskDelay(pdMS_TO_TICKS(10000));
+      continue;
+    }
     if (!cctv_wifi_any_profile_configured()) {
+      g_wifiStatus = "No WiFi profiles saved";
+      tries = 0;
       vTaskDelay(pdMS_TO_TICKS(15000));
       continue;
     }
     if (WiFi.status() == WL_CONNECTED) {
+      tries = 0;
+      g_wifiRetryExhausted = false;
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
     }
+
+    // 3 tries done → 5 min cooldown, fir reset aur repeat
+    if (tries >= WIFI_MAX_TRIES) {
+      g_wifiRetryExhausted = true;
+      g_wifiStatus = "WiFi failed \xe2\x80\x94 next retry in 5 min";
+      SDBGf("[WiFi] %u tries done, cooling down %lu ms\n",
+            (unsigned)WIFI_MAX_TRIES, (unsigned long)WIFI_COOLDOWN_MS);
+      for (uint32_t waited = 0; waited < WIFI_COOLDOWN_MS; waited += 2000) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        if (g_wifiScanRequested || WiFi.status() == WL_CONNECTED) break;
+      }
+      tries = 0;
+      g_wifiRetryExhausted = false;
+      continue;
+    }
+
     if (!cctv_wifi_try_lock(200)) {
       vTaskDelay(pdMS_TO_TICKS(2000));
       continue;
     }
-    SDBGln(F("[WiFi] Background STA: trying saved profiles\xe2\x80\xa6"));
+    tries++;
+    SDBGf("[WiFi] Background STA: try %u/%u\n", (unsigned)tries, (unsigned)WIFI_MAX_TRIES);
     g_wifiStatus = "Connecting (STA)\xe2\x80\xa6";
     const bool ok = cctv_wifi_try_connect_profiles(15000);
+    if (!ok) {
+      WiFi.disconnect(false, true);
+      (void)esp_wifi_sta_enterprise_disable();
+    }
     cctv_wifi_unlock();
     if (ok) {
       SDBGf("[WiFi] STA OK  IP: %s\n", WiFi.localIP().toString().c_str());
+      tries = 0;
+      g_wifiRetryExhausted = false;
       cctv_time_kick_sync_if_needed(true);
       vTaskDelay(pdMS_TO_TICKS(3000));
     } else {
-      g_wifiStatus = "Not connected \xe2\x80\x94 retry in ~12s";
-      vTaskDelay(pdMS_TO_TICKS(12000));
+      g_wifiStatus = "Retrying WiFi\xe2\x80\xa6";
+      vTaskDelay(pdMS_TO_TICKS(8000));
     }
   }
 }
@@ -355,7 +399,7 @@ void loadWifiAutoConnect() {
 #endif
 
 void startClockSync() {
-  configTzTime(kTimezone, kNtpServer);
+  configTzTime(kTimezone, kNtpServer1, kNtpServer2);
   g_ntpSyncPending = true;
   g_ntpSyncDone = false;
   g_ntpSyncStartMs = millis();
@@ -637,27 +681,6 @@ bool saveJpegBufferToSd(const uint8_t *jpegBuf, size_t jpegLen, String *savedPat
 
 
 
-static void configureSensorDefaults() {
-  sensor_t *s = esp_camera_sensor_get();
-  if (!s) {
-    g_cameraStatusMessage = "Sensor handle not available";
-    return;
-  }
-
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 0);
-    s->set_brightness(s, 1);
-    s->set_saturation(s, -1);
-    s->set_whitebal(s, 1);
-    s->set_gain_ctrl(s, 1);
-    s->set_exposure_ctrl(s, 1);
-    s->set_awb_gain(s, 1);
-    s->set_aec2(s, 1);
-  }
-
-  g_cameraStatusMessage = "Sensor tuned";
-}
 
 bool remountMicroSD() {
   SD_MMC.end();
@@ -869,6 +892,13 @@ void recordingTask(void *parameter) {
   AviRecorder recorder;
 
   while (true) {
+    // No valid clock → don't record (files need correct timestamps)
+    if (!cctv_wall_clock_sane()) {
+      g_recordingStatus = "Waiting for time sync\xe2\x80\xa6";
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      continue;
+    }
+
     if (!g_sdReady) {
       g_recordingStatus = "Waiting for SD";
       vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -890,11 +920,10 @@ void recordingTask(void *parameter) {
 
     g_recordingFile = path;
     const uint32_t segStart = millis();
-    // Wall-clock grid: frame i is due at segStart + i * kFrameMs. If we fall behind by
-    // a full slot, skip indices (drop) instead of bursting — keeps OSD time vs playback aligned.
     uint32_t frameIdx = 0;
+    bool timeLost = false;
 
-    while (g_sdReady && (millis() - segStart < kSegmentMs)) {
+    while (g_sdReady && !timeLost && (millis() - segStart < kSegmentMs)) {
       // Catch up dropped frames in O(1) — the old inner while incremented frameIdx in a
       // tight loop and could starve IDLE0 → task_wdt / Guru Meditation on busy builds.
       const uint32_t wall = millis() - segStart;
@@ -974,8 +1003,13 @@ void recordingTask(void *parameter) {
 
       frameIdx++;
 
-      // Update status string every ~30 frames (~2 s)
       if (recorder.frameCount() % 30 == 0) {
+        // Check clock every ~2 sec — if time lost, emergency save
+        if (!cctv_wall_clock_sane()) {
+          timeLost = true;
+          SDBGln(F("[REC] Clock lost — emergency save"));
+          break;
+        }
         String fname = path.substring(path.lastIndexOf('/') + 1);
         g_recordingStatus = "REC " + fname + " [" + String(recorder.frameCount()) + "]";
       }
@@ -986,8 +1020,13 @@ void recordingTask(void *parameter) {
     recorder.end(wallSpan);
     g_recordingFile = "";
     String fname = path.substring(path.lastIndexOf('/') + 1);
-    g_recordingStatus = "Saved: " + fname + " (" + String(savedFrames) + " fr)";
-    SDBGf("[REC] Segment: %s  %u frames\n", path.c_str(), savedFrames);
+    if (timeLost) {
+      g_recordingStatus = "Saved (clock lost): " + fname + " (" + String(savedFrames) + " fr)";
+      SDBGf("[REC] Emergency save: %s  %u frames\n", path.c_str(), savedFrames);
+    } else {
+      g_recordingStatus = "Saved: " + fname + " (" + String(savedFrames) + " fr)";
+      SDBGf("[REC] Segment: %s  %u frames\n", path.c_str(), savedFrames);
+    }
   }
 }
 
@@ -1124,9 +1163,7 @@ void setup() {
   warmupCamera(4);
   g_cameraStatusMessage = "Sensor ready";
 
-  // ── v2.0 Addon modules: OLED, DHT, PIR, MQTT ─────────────────────────
-  // cctv_oled_init();           // DISABLED — GPIO 1 (SDA) temporarily used as ETH SCK
-  // cctv_oled_boot_animation(); // DISABLED
+  // ── v2.0 Addon modules: DHT, PIR, MQTT ──────────────────────────────
   cctv_dht_init();              // DHT11 sensor + background read task
   cctv_pir_init();              // PIR ISR on GPIO 41
   cctv_mqtt_init();             // Load MQTT config from NVS
@@ -1189,7 +1226,6 @@ void setup() {
   }
 
   // ── v2.0: start background tasks after HTTP is up ────────────────────
-  cctv_oled_start_task();       // OLED page-rotation on Core 1
   cctv_mqtt_start_task();       // MQTT reconnect + telemetry push on Core 0
 
   {

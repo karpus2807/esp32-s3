@@ -49,8 +49,8 @@ void cctv_print_devstatus(Print &out) {
              (unsigned long)chip_info.features);
 
   UBaseType_t idle0Wm = 0, idle1Wm = 0;
-  TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
-  TaskHandle_t idle1 = xTaskGetIdleTaskHandleForCPU(1);
+  TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCore(0);
+  TaskHandle_t idle1 = xTaskGetIdleTaskHandleForCore(1);
   if (idle0) {
     idle0Wm = uxTaskGetStackHighWaterMark(idle0);
   }

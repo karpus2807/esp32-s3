@@ -20,10 +20,12 @@ extern bool g_wifiEnterprise;
 extern String g_wifiIdentity;
 extern String g_wifiEapPass;
 extern String g_timeHttpUrl;
+extern volatile bool g_wifiAutoConnect;
 
 extern void saveWifiConfig();
 extern void clearWifiConfig();
 extern void saveTimeHttpConfig();
+extern void saveWifiAutoConnect();
 
 static void apply_eth_static_addrs(Print &out,
                                    const IPAddress &ip,

@@ -43,6 +43,16 @@
 #ifndef CCTV_JPEG_QUALITY
 #define CCTV_JPEG_QUALITY 12
 #endif
+// Move normal malloc allocations to PSRAM earlier (bytes and above).
+// Lower threshold = more pressure moved away from internal RAM.
+#ifndef CCTV_EXTMEM_MALLOC_THRESHOLD
+#define CCTV_EXTMEM_MALLOC_THRESHOLD 16
+#endif
+// Camera FB count when PSRAM is available. Higher count smooths stream but uses
+// more driver/buffer resources; 6 is a safer balance for ETH + camera workload.
+#ifndef CCTV_CAMERA_FB_COUNT_PSRAM
+#define CCTV_CAMERA_FB_COUNT_PSRAM 6
+#endif
 // AVI segment frame rate (with OSD re-encode, 8–10 is smoother than 12 on ESP32-S3).
 #ifndef CCTV_RECORD_FPS
 #define CCTV_RECORD_FPS 12

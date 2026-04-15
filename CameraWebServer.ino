@@ -1028,7 +1028,7 @@ void setup() {
 #endif
   cctv_platform_init();
 #if CONFIG_SPIRAM_USE_MALLOC
-  heap_caps_malloc_extmem_enable(64);
+  heap_caps_malloc_extmem_enable(CCTV_EXTMEM_MALLOC_THRESHOLD);
 #endif
   g_bootMillis = millis();
   SDBGf("\n");
@@ -1068,13 +1068,15 @@ void setup() {
   // Many JPEG framebuffers in internal DRAM will exhaust heap (~30–50KB left) and break SD / httpd.
   // Do not rely on psramFound() alone — on IDF 5.x, SPIRAM heap may work while Arduino reports 0.
   if (cctv_psram_app_ready()) {
-    config.fb_count = 8;
+    config.fb_count = CCTV_CAMERA_FB_COUNT_PSRAM;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     Serial.printf(
-        "[BOOT] PSRAM OK  heap_caps total=%u free=%u  Arduino getPsram=%u\n",
+        "[BOOT] PSRAM OK  heap_caps total=%u free=%u  Arduino getPsram=%u  extmem_threshold=%u  fb_count=%u\n",
         (unsigned) cctv_psram_total_bytes(),
         (unsigned) cctv_psram_free_bytes(),
-        (unsigned) ESP.getPsramSize());
+        (unsigned) ESP.getPsramSize(),
+        (unsigned) CCTV_EXTMEM_MALLOC_THRESHOLD,
+        (unsigned) CCTV_CAMERA_FB_COUNT_PSRAM);
   } else {
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;

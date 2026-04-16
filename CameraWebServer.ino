@@ -1014,7 +1014,7 @@ void clearWifiConfig() {
 void recordingTask(void *parameter) {
   const uint8_t  kFps          = CCTV_RECORD_FPS;
   const uint32_t kFrameMs      = 1000u / kFps;
-  const uint32_t kSegmentMs    = 30u * 60u * 1000u;     // 30 minutes per AVI segment
+  const uint32_t kSegmentMs    = CCTV_RECORD_SEGMENT_MS;
   const uint64_t kMinFreeBytes = 50ULL * 1024 * 1024;   // stop at < 50 MB free
 
   // Do not call esp_task_wdt_delete() here: on Arduino-ESP32 this task is often

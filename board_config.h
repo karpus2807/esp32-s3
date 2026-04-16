@@ -57,6 +57,11 @@
 #ifndef CCTV_RECORD_FPS
 #define CCTV_RECORD_FPS 8
 #endif
+// Continuous AVI: roll to a new file after this many ms.
+// Now: 1 minute (testing). Production: `#define CCTV_RECORD_SEGMENT_MS (60ull * 60ull * 1000ull)` (1 h).
+#ifndef CCTV_RECORD_SEGMENT_MS
+#define CCTV_RECORD_SEGMENT_MS (1u * 60u * 1000u)
+#endif
 
 // HTTP JSON time source (JSON with "unixtime" or "epoch"). Default unless NVS thDis=1 (timeurl off).
 #ifndef CCTV_WORLD_TIME_HTTP_URL

@@ -36,7 +36,7 @@
 #include "cctv_web_control.h"
 #include "cctv_ui_log.h"
 #include "cctv_dht.h"
-#include "cctv_pir.h"
+#include "cctv_cam_motion.h"
 #include "cctv_mqtt.h"
 #include "cctv_telemetry.h"
 #include <stdlib.h>
@@ -81,6 +81,7 @@ bool saveJpegBufferToSd(const uint8_t *jpegBuf, size_t jpegLen, String *savedPat
 bool remountMicroSD();
 bool testMicroSD(String *message = nullptr);
 size_t clearCaptures(String *message = nullptr);
+size_t clearSdAll(String *message = nullptr);
 String listCapturesJson(size_t limit = 20);
 void saveWifiConfig();
 void clearWifiConfig();
@@ -899,6 +900,9 @@ static esp_err_t storage_handler(httpd_req_t *req) {
     testMicroSD(&actionMessage);
   } else if (action == "wipe") {
     removed = clearCaptures(&actionMessage);
+  } else if (action == "format") {
+    // Deep-wipe everything on the SD card (keeps filesystem, deletes all content).
+    removed = clearSdAll(&actionMessage);
   }
 
   uint64_t totalMB = g_sdReady ? (SD_MMC.totalBytes() / (1024 * 1024)) : 0;
@@ -1055,7 +1059,7 @@ static esp_err_t iot_handler(httpd_req_t *req) {
   // Returns live sensor data + config fields
   const CctvMqttConfig &cfg = cctv_mqtt_config();
   String json;
-  json.reserve(512);
+  json.reserve(768);
   json = "{";
 
   // Live sensor data
@@ -1067,13 +1071,23 @@ static esp_err_t iot_handler(httpd_req_t *req) {
   }
   json += ",\"dhtOk\":";       json += cctv_dht_ok() ? "true" : "false";
   json += ",\"dhtStatus\":\""; json += cctv_dht_status_str(); json += "\"";
-  json += ",\"pirAlert\":";    json += cctv_pir_alert() ? "true" : "false";
-  json += ",\"pirAgeS\":";     json += String(cctv_pir_last_trigger_age_s());
+  const int motion = cctv_cam_motion_alert() ? 1 : 0;
+  json += ",\"motion\":";      json += String(motion);
+  json += ",\"movingNow\":";   json += cctv_cam_motion_moving_now() ? "true" : "false";
+  json += ",\"onCnt\":";       json += String((int)cctv_cam_motion_on_count());
+  json += ",\"offCnt\":";      json += String((int)cctv_cam_motion_off_count());
+  json += ",\"motionAgeS\":";  json += String(cctv_cam_motion_last_trigger_age_s());
+  json += ",\"motionScore\":"; json += String((int)cctv_cam_motion_score());
+  json += ",\"motionScoreSm\":"; json += String((int)cctv_cam_motion_score_smooth());
+  json += ",\"motionThreshold\":"; json += String((int)cctv_cam_motion_threshold());
+  json += ",\"motionThresholdEff\":"; json += String((int)cctv_cam_motion_threshold_effective());
+  json += ",\"motionNoise\":"; json += String((int)cctv_cam_motion_noise_floor());
   json += ",\"alertLevel\":";  json += String(cctv_telemetry_alert_level());
   json += ",\"mqttConnected\":"; json += cctv_mqtt_connected() ? "true" : "false";
   json += ",\"mqttStatus\":\"";  json += cctv_mqtt_status_str(); json += "\"";
 
   // Config fields
+  json += ",\"mqttEnabled\":"; json += cfg.enabled ? "true" : "false";
   json += ",\"server\":\"";   json += cfg.server; json += "\"";
   json += ",\"port\":";       json += String(cfg.port);
   json += ",\"token\":\"";    json += cfg.token; json += "\"";
@@ -1105,6 +1119,9 @@ static esp_err_t iot_save_handler(httpd_req_t *req) {
   httpd_req_get_url_query_str(req, qbuf, q_len);
 
   char val[128];
+  if (httpd_query_key_value(qbuf, "mqttEnabled", val, sizeof(val)) == ESP_OK) {
+    cfg.enabled = (atoi(val) != 0);
+  }
   if (httpd_query_key_value(qbuf, "server", val, sizeof(val)) == ESP_OK)
     strlcpy(cfg.server, val, sizeof(cfg.server));
   if (httpd_query_key_value(qbuf, "port", val, sizeof(val)) == ESP_OK)
@@ -1121,6 +1138,9 @@ static esp_err_t iot_save_handler(httpd_req_t *req) {
     cfg.criticalTemp = atof(val);
   if (httpd_query_key_value(qbuf, "alertTemp", val, sizeof(val)) == ESP_OK)
     cfg.alertTemp = atof(val);
+  if (httpd_query_key_value(qbuf, "motionThreshold", val, sizeof(val)) == ESP_OK) {
+    (void)cctv_cam_motion_set_threshold((uint8_t)atoi(val));
+  }
 
   free(qbuf);
   cctv_mqtt_save_config();
@@ -1389,6 +1409,29 @@ button:hover{opacity:.82}
       </div>
     </div>
     <div id="wifiStatusRow" style="font-size:.8rem;color:#94a3b8;margin-top:4px">-</div>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid #334155">
+      <label class="inp-lbl">WiFi module (Serial / console — same as <span class="mono">/api/console</span>)</label>
+      <p style="font-size:.72rem;color:#64748b;margin:0 0 8px 0">Web <b>Scan</b> = JSON list. <b>Console scan</b> = numbered list; phir niche command box me <span class="mono">1 norm pass:YOURPASS</span> jaise join.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+        <button type="button" class="bn sm" onclick="wifiModCmd('wifistatus')">Status</button>
+        <button type="button" class="bn sm" onclick="wifiModCmd('wifiprofiles')">List profiles</button>
+        <button type="button" class="bn sm" onclick="wifiModCmd('wifiscan')">Console scan</button>
+        <button type="button" class="bn sm" onclick="scanWifi()">Web scan</button>
+        <button type="button" class="bn sm" onclick="wifiModCmd('autowifi on')">Auto ON</button>
+        <button type="button" class="bd sm" onclick="wifiModCmd('autowifi off')">Auto OFF</button>
+        <button type="button" class="bp sm" onclick="wifiReconnectSlot()">Reconnect slot</button>
+        <button type="button" class="bd sm" onclick="wifiModCmd('clearwifi',true)">Clear NVS</button>
+        <button type="button" class="bd sm" onclick="wifiModCmd('wifidel 0',true)">Del slot 1</button>
+        <button type="button" class="bd sm" onclick="wifiModCmd('wifidel 1',true)">Del slot 2</button>
+        <button type="button" class="bd sm" onclick="wifiModCmd('wifidel 2',true)">Del slot 3</button>
+      </div>
+      <label class="inp-lbl" style="margin-top:6px">Custom WiFi command</label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        <input id="wifiModCmdIn" class="inp" type="text" maxlength="200" placeholder="wifiprofiles / wifidel 0 / clearwifi …" style="flex:1;min-width:180px" autocomplete="off">
+        <button type="button" class="bp sm" onclick="wifiModRun()">Run</button>
+      </div>
+      <pre id="wifiModOut" class="mono" style="display:none;margin-top:8px;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:8px;font-size:.72rem;max-height:220px;overflow:auto;white-space:pre-wrap;color:#cbd5e1"></pre>
+    </div>
     <div id="wifiPanel" style="display:none;margin-top:10px">
       <div class="panel-grid">
         <div class="full">
@@ -1441,6 +1484,7 @@ button:hover{opacity:.82}
       <button class="bn" onclick="sdAct('remount')">&#8635; Re-mount SD</button>
       <button class="bn" onclick="sdAct('test')">&#10003; Test SD</button>
       <button class="bd" onclick="if(confirm('Delete ALL recordings?'))sdAct('wipe')">&#128465; Wipe All</button>
+      <button class="bd" onclick="if(confirm('FORMAT microSD? This will erase EVERYTHING on the card.'))sdAct('format')">&#9888; Format SD</button>
       <button class="bd" onclick="rebootDevice()">&#9211; Reboot</button>
     </div>
     <div id="msg"></div>
@@ -1501,7 +1545,9 @@ button:hover{opacity:.82}
         <div class="row"><span class="lbl">DHT Status</span><span id="iotDhtSt" class="badge y">--</span></div>
       </div>
       <div>
-        <div class="row"><span class="lbl">PIR Motion</span><span id="iotPir" class="badge y">--</span></div>
+        <div class="row"><span class="lbl">Camera Motion</span><span id="iotMotion" class="badge y">--</span></div>
+        <div class="row"><span class="lbl">Motion Score</span><span id="iotMotionScore" style="font-size:.78rem;color:#94a3b8">--</span></div>
+        <div class="row"><span class="lbl">Noise floor</span><span id="iotMotionNoise" style="font-size:.78rem;color:#94a3b8">--</span></div>
         <div class="row"><span class="lbl">Alert Level</span><span id="iotAlert" class="badge y">--</span></div>
         <div class="row"><span class="lbl">MQTT</span><span id="iotMqtt" class="badge y">--</span></div>
       </div>
@@ -1510,11 +1556,18 @@ button:hover{opacity:.82}
       <div>
       </div>
       <div>
-        <div class="row"><span class="lbl">Last PIR</span><span id="iotPirAge" style="font-size:.78rem;color:#94a3b8">--</span></div>
+        <div class="row"><span class="lbl">Last Motion</span><span id="iotMotionAge" style="font-size:.78rem;color:#94a3b8">--</span></div>
       </div>
     </div>
     <div id="iotPanel" style="display:none;margin-top:10px">
       <div class="panel-grid">
+        <div style="display:flex;align-items:center;gap:10px">
+          <label class="inp-lbl" style="margin:0">MQTT Enabled</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:.9rem;cursor:pointer;color:#cbd5e1">
+            <input id="iotMqEn" type="checkbox">
+            <span id="iotMqEnLbl" style="color:#94a3b8">--</span>
+          </label>
+        </div>
         <div><label class="inp-lbl">MQTT Server</label><input id="iotSrv" class="inp" type="text" placeholder="thingsboard.ipserver.in"></div>
         <div><label class="inp-lbl">Port</label><input id="iotPort" class="inp" type="number" placeholder="1883"></div>
         <div class="full"><label class="inp-lbl">Device Access Token</label><input id="iotTok" class="inp" type="text" placeholder="ThingsBoard device token"></div>
@@ -1523,6 +1576,8 @@ button:hover{opacity:.82}
         <div><label class="inp-lbl">Warn Temp (&deg;C)</label><input id="iotWarnT" class="inp" type="number" step="0.1" placeholder="40"></div>
         <div><label class="inp-lbl">Critical Temp (&deg;C)</label><input id="iotCritT" class="inp" type="number" step="0.1" placeholder="50"></div>
         <div><label class="inp-lbl">Alert Temp (&deg;C)</label><input id="iotAlrtT" class="inp" type="number" step="0.1" placeholder="35"></div>
+        <div><label class="inp-lbl">Motion trigger score (%)</label><input id="iotMotionThr" class="inp" type="number" min="5" max="95" placeholder="45" title="Motion triggers only when filtered score is at/above this percent"></div>
+        <div class="full" style="margin-top:6px;font-size:.78rem;color:#94a3b8">Dark-room tuned: trigger uses <b>effective threshold = max(your threshold, noise floor + margin)</b> with smoothing + consecutive frames.</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="bw sm" onclick="saveIotConfig()">&#10003; Save IoT Config</button>
@@ -1904,7 +1959,6 @@ async function scanWifi(){
 }
 
 function selectSsidFromEl(el){selectSsid(el.dataset.ssid,parseInt(el.dataset.ent)||0);}
-function selectSsidFromEl(el){selectSsid(el.dataset.ssid,parseInt(el.dataset.ent)||0);}
 function selectSsid(ssid, isEnt){
   document.getElementById('wSsid').value=ssid;
   document.getElementById('scanResultsRow').style.display='none';
@@ -1937,6 +1991,51 @@ async function toggleWifiRadio(){
     toast(j.out||cmd);
     btn.textContent=isOn?'WiFi ON':'WiFi OFF';
     btn.className=isOn?'bn sm':'bd sm';
+    refreshStatus();
+  }catch(e){ toast('Error: '+e.message); }
+}
+
+async function wifiModCmd(cmd,needConfirm){
+  if(needConfirm){
+    const w=(cmd==='clearwifi')?'Clear ALL saved WiFi from NVS?':('Run: '+cmd+' ?');
+    if(!confirm(w)) return;
+  }
+  const pre=document.getElementById('wifiModOut');
+  try{
+    const r=await fetch('/api/console?cmd='+encodeURIComponent(cmd));
+    const j=await r.json();
+    const t=(j&&j.out)?j.out:((j&&j.error)?String(j.error):'(no output)');
+    pre.style.display='block';
+    pre.textContent=t;
+    toast(cmd);
+    if(cmd==='wifiscan'||cmd.startsWith('wifidel')||cmd==='clearwifi'||cmd.startsWith('autowifi')){
+      await loadWifiConfig();
+      refreshStatus();
+    }
+  }catch(e){ pre.style.display='block'; pre.textContent='Error: '+e.message; toast(e.message); }
+}
+
+async function wifiModRun(){
+  const inp=document.getElementById('wifiModCmdIn');
+  const c=(inp&&inp.value)?inp.value.trim():'';
+  if(!c){ toast('Enter command');return;}
+  const risky=/^(clearwifi|wifidel\b|reboot)/i.test(c);
+  await wifiModCmd(c,risky);
+  inp.value='';
+}
+
+async function wifiReconnectSlot(){
+  const sel=document.getElementById('wSlot');
+  const slot=sel?parseInt(sel.value,10):0;
+  if(isNaN(slot)||slot<0||slot>2){ toast('Invalid slot');return;}
+  try{
+    const r=await fetch('/wifi?useslot='+slot);
+    const j=await r.json();
+    const pre=document.getElementById('wifiModOut');
+    pre.style.display='block';
+    pre.textContent=JSON.stringify(j,null,2);
+    toast('Reconnect slot '+(slot+1));
+    await loadWifiConfig();
     refreshStatus();
   }catch(e){ toast('Error: '+e.message); }
 }
@@ -2047,6 +2146,13 @@ function togglePreview(){
 async function loadIotConfig(){
   try{
     const j=await fetch('/api/iot').then(r=>r.json());
+    if(j.mqttEnabled!==undefined){
+      const en=!!j.mqttEnabled;
+      const cb=document.getElementById('iotMqEn');
+      const lb=document.getElementById('iotMqEnLbl');
+      if(cb) cb.checked=en;
+      if(lb) lb.textContent=en?'Enabled':'Disabled';
+    }
     if(j.server!==undefined) document.getElementById('iotSrv').value=j.server;
     if(j.port!==undefined) document.getElementById('iotPort').value=j.port;
     if(j.token!==undefined) document.getElementById('iotTok').value=j.token;
@@ -2055,10 +2161,12 @@ async function loadIotConfig(){
     if(j.warnTemp!==undefined) document.getElementById('iotWarnT').value=j.warnTemp;
     if(j.criticalTemp!==undefined) document.getElementById('iotCritT').value=j.criticalTemp;
     if(j.alertTemp!==undefined) document.getElementById('iotAlrtT').value=j.alertTemp;
+    if(j.motionThreshold!==undefined) document.getElementById('iotMotionThr').value=j.motionThreshold;
   }catch(e){}
 }
 async function saveIotConfig(){
   const params=new URLSearchParams();
+  params.set('mqttEnabled',document.getElementById('iotMqEn').checked?'1':'0');
   params.set('server',document.getElementById('iotSrv').value);
   params.set('port',document.getElementById('iotPort').value);
   params.set('token',document.getElementById('iotTok').value);
@@ -2067,6 +2175,7 @@ async function saveIotConfig(){
   params.set('warnTemp',document.getElementById('iotWarnT').value);
   params.set('criticalTemp',document.getElementById('iotCritT').value);
   params.set('alertTemp',document.getElementById('iotAlrtT').value);
+  params.set('motionThreshold',document.getElementById('iotMotionThr').value);
   try{
     const r=await fetch('/api/iot/save?'+params.toString());
     const j=await r.json();
@@ -2074,6 +2183,15 @@ async function saveIotConfig(){
     toast(j&&j.ok?'IoT config saved':'Save failed');
   }catch(e){document.getElementById('iotMsg').textContent='Error: '+e.message;}
 }
+
+// Keep label in sync when user toggles checkbox.
+document.addEventListener('DOMContentLoaded',function(){
+  const cb=document.getElementById('iotMqEn');
+  const lb=document.getElementById('iotMqEnLbl');
+  if(cb && lb){
+    cb.addEventListener('change',()=>{lb.textContent=cb.checked?'Enabled':'Disabled';});
+  }
+});
 async function refreshIot(){
   try{
     const j=await fetch('/api/iot').then(r=>r.json());
@@ -2083,16 +2201,25 @@ async function refreshIot(){
     if(j.hum!==null&&j.hum!==undefined){he.textContent=j.hum.toFixed(0)+' %';}else{he.textContent='--';}
     const ds=document.getElementById('iotDhtSt');
     ds.textContent=j.dhtStatus||'--';ds.className='badge '+(j.dhtOk?'g':'r');
-    const pe=document.getElementById('iotPir');
-    pe.textContent=j.pirAlert?'MOTION':'No motion';pe.className='badge '+(j.pirAlert?'r':'g');
+    const pe=document.getElementById('iotMotion');
+    pe.textContent=j.motion?'MOTION':'No motion';pe.className='badge '+(j.motion?'r':'g');
+    const pr=document.getElementById('iotMotionScore');
+    if(pr&&j.motionScore!==undefined){
+      const thr=(j.motionThreshold!==undefined)?j.motionThreshold:'?';
+      const eff=(j.motionThresholdEff!==undefined)?j.motionThresholdEff:'?';
+      const sm=(j.motionScoreSm!==undefined)?j.motionScoreSm:'?';
+      pr.textContent=j.motionScore+'% (sm '+sm+'%, user '+thr+'%, eff '+eff+'%)';
+    }
+    const pn=document.getElementById('iotMotionNoise');
+    if(pn&&j.motionNoise!==undefined){pn.textContent=j.motionNoise+'%';}
     const al=document.getElementById('iotAlert');
-    const alv=j.alertLevel||1;
-    al.textContent=alv>=3?'CRITICAL':alv>=2?'WARNING':'NORMAL';
-    al.className='badge '+(alv>=3?'r':alv>=2?'y':'g');
+    const alv=(j.alertLevel!==undefined && j.alertLevel!==null)?Number(j.alertLevel):0;
+    al.textContent=alv>=3?'CRITICAL':alv>=2?'WARNING':alv>=1?'ALERT':'OK';
+    al.className='badge '+(alv>=3?'r':alv>=2?'y':alv>=1?'y':'g');
     const mq=document.getElementById('iotMqtt');
     mq.textContent=j.mqttConnected?'Connected':'Disconnected';mq.className='badge '+(j.mqttConnected?'g':'r');
-    const pa=document.getElementById('iotPirAge');
-    if(j.pirAgeS>0){pa.textContent=j.pirAgeS+'s ago';}else{pa.textContent='never';}
+    const pa=document.getElementById('iotMotionAge');
+    if(j.motionAgeS>0){pa.textContent=j.motionAgeS+'s ago';}else{pa.textContent='never';}
   }catch(e){}
 }
 
@@ -2595,6 +2722,7 @@ static esp_err_t wifi_handler(httpd_req_t *req) {
         const bool ok = cctv_wifi_try_connect_profiles(18000);
         cctv_wifi_unlock();
         if (ok) {
+          esp_wifi_set_ps(WIFI_PS_NONE);
           g_wifiStatus = "Connected: " + WiFi.localIP().toString();
           log_i("[WiFi] Connected %s (no reboot)", WiFi.localIP().toString().c_str());
           ui_debug_logf("[WiFiCfg] reconnect success ip=%s rssi=%d",

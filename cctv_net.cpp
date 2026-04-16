@@ -573,12 +573,24 @@ static void cctv_net_dns_fallback_one(esp_netif_t *n) {
 void cctv_net_apply_fallback_dns(void) {
 #if CONFIG_ESP_WIFI_ENABLED
   if (WiFi.status() == WL_CONNECTED) {
-    cctv_net_dns_fallback_one(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"));
+    // Prefer direct netif handle; fallback to ifkey for older cores.
+    esp_netif_t *n = nullptr;
+    // WiFiClass exposes netif in recent Arduino-ESP32; keep this guarded for compatibility.
+    // If unavailable at compile-time, the ifkey fallback still works.
+#if __has_include(<esp_netif.h>)
+    n = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+#endif
+    cctv_net_dns_fallback_one(n);
   }
 #endif
 #if CCTV_USE_ETH_W5500 && CONFIG_ETH_ENABLED
   if (s_eth_started && ETH.linkUp() && (uint32_t)ETH.localIP() != 0u) {
-    cctv_net_dns_fallback_one(esp_netif_get_handle_from_ifkey("ETH_DEF"));
+    // Use the actual ETH netif when available; ifkey names vary across cores.
+    esp_netif_t *n = ETH.netif();
+    if (!n) {
+      n = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    }
+    cctv_net_dns_fallback_one(n);
   }
 #endif
 }

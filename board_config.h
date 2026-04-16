@@ -55,7 +55,7 @@
 #endif
 // AVI segment frame rate (with OSD re-encode, 8–10 is smoother than 12 on ESP32-S3).
 #ifndef CCTV_RECORD_FPS
-#define CCTV_RECORD_FPS 12
+#define CCTV_RECORD_FPS 8
 #endif
 
 // HTTP JSON time source (JSON with "unixtime" or "epoch"). Default unless NVS thDis=1 (timeurl off).
@@ -86,10 +86,15 @@
 #ifndef CCTV_OSD_JPEG_QUALITY_RECORD
 #define CCTV_OSD_JPEG_QUALITY_RECORD 14
 #endif
-// OSD stamp interval: stamp every Nth frame (1=every, 9=once/sec at 9fps, 12=once/sec at 12fps).
-// Reduces CPU: JPEG decode+encode only on stamped frames.
+// OSD stamp interval (reserved for future stream stamping). Recording uses *_RECORD below.
 #ifndef CCTV_OSD_STAMP_EVERY_N
-#define CCTV_OSD_STAMP_EVERY_N CCTV_RECORD_FPS
+#define CCTV_OSD_STAMP_EVERY_N 12
+#endif
+// AVI recording: stamp every N **written** frames (must not use frameIdx — catch-up skips
+// indices and timestamps vanished). Default 1 = every frame (best evidence consistency).
+// Increase to 3–6 only if CPU cannot keep up.
+#ifndef CCTV_OSD_STAMP_EVERY_N_RECORD
+#define CCTV_OSD_STAMP_EVERY_N_RECORD 1
 #endif
 
 // W5500 SPI Ethernet (initial setup + web UI over LAN without WiFi)
@@ -176,12 +181,20 @@
 #define CCTV_DHT_READ_INTERVAL_MS 5000
 #endif
 
-// PIR HC-SR501 motion sensor
+// PIR HC-SR501 motion sensor (must not overlap camera_pins.h for your board; OceanLabz: 41 is free)
 #ifndef CCTV_PIR_PIN
 #define CCTV_PIR_PIN 41
 #endif
 #ifndef CCTV_PIR_DEBOUNCE_MS
 #define CCTV_PIR_DEBOUNCE_MS 2000
+#endif
+// Serial: print "PIR: motion detected" / "PIR: no motion" when GPIO changes (poll ~100ms). 0 = off.
+#ifndef CCTV_PIR_SERIAL_INTERVAL_MS
+#define CCTV_PIR_SERIAL_INTERVAL_MS 1
+#endif
+// Also print a status line every N ms (raw pin + filtered motion) so the monitor is never silent. 0 = edges only.
+#ifndef CCTV_PIR_SERIAL_STATUS_MS
+#define CCTV_PIR_SERIAL_STATUS_MS 5000
 #endif
 
 // MQTT / ThingsBoard defaults

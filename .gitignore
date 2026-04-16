@@ -1,5 +1,7 @@
 backup/
 build/
+esp-idf/
+esp-who/
 *.bin
 *.o
 *.d

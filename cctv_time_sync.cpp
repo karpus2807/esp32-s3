@@ -17,6 +17,8 @@ bool cctvHttpTimeSync(const char *url) {
   if (!cctv_has_ip_for_internet()) {
     return false;
   }
+  // Ensure DNS is set even if DHCP left it empty (common on some LANs/VLANs).
+  cctv_net_apply_fallback_dns();
 
   HTTPClient http;
   http.setTimeout(4000);
@@ -110,6 +112,7 @@ void cctv_time_kick_sync_if_needed(bool force) {
     return;
   }
   s_lastKickMs = m;
+  cctv_net_apply_fallback_dns();
   startClockSync();
   tryHttpWorldClockSync();
 }

@@ -1,7 +1,7 @@
 // cctv_telemetry.cpp — Collect all 25+ telemetry fields into JSON
 #include "cctv_telemetry.h"
 #include "cctv_dht.h"
-#include "cctv_pir.h"
+#include "cctv_cam_motion.h"
 #include "cctv_mqtt.h"
 #include "cctv_net.h"
 #include "board_config.h"
@@ -28,12 +28,18 @@ String cctv_eth_mac_string() {
 // ────────── alert level ──────────
 
 int cctv_telemetry_alert_level() {
-  if (!cctv_dht_ok()) return 1;
+  // 0..3 scale:
+  // 0 = below alert temp
+  // 1 = alert temp .. < warn temp
+  // 2 = warn temp  .. < critical temp
+  // 3 = critical and above
+  if (!cctv_dht_ok()) return 0;
   float t = cctv_dht_temperature();
   const CctvMqttConfig &cfg = cctv_mqtt_config();
   if (t >= cfg.criticalTemp) return 3;
   if (t >= cfg.warnTemp)     return 2;
-  return 1;
+  if (t >= cfg.alertTemp)    return 1;
+  return 0;
 }
 
 // ────────── JSON builder ──────────
@@ -57,8 +63,10 @@ String cctv_telemetry_build_json() {
     j += "\"temperature\":null,\"humidity\":null";
   }
 
-  // PIR
-  j += ",\"pir_alert\":";     j += cctv_pir_alert() ? "true" : "false";
+  // Camera motion: explicit numeric telemetry for ThingsBoard rules.
+  const int motion = cctv_cam_motion_alert() ? 1 : 0;
+  j += ",\"motion_detect\":"; j += String(motion);
+  j += ",\"pir_alert\":";     j += String(motion); // backward-compatible key
 
   // Alert
   j += ",\"alert_level\":";   j += String(cctv_telemetry_alert_level());

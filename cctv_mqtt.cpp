@@ -1,7 +1,7 @@
 // cctv_mqtt.cpp — MQTT client for ThingsBoard
 #include "cctv_mqtt.h"
 #include "cctv_telemetry.h"
-#include "cctv_pir.h"
+#include "cctv_cam_motion.h"
 #include "cctv_net.h"
 #include "board_config.h"
 #include <WiFi.h>
@@ -21,6 +21,7 @@ static SemaphoreHandle_t s_mtx = nullptr;
 void cctv_mqtt_load_config() {
   Preferences p;
   p.begin("iot", true);
+  s_cfg.enabled         = p.getBool("mqEn", true);
   strlcpy(s_cfg.server,   p.getString("mqSrv",  CCTV_MQTT_DEFAULT_SERVER).c_str(), sizeof(s_cfg.server));
   s_cfg.port            = p.getUShort("mqPort",  CCTV_MQTT_DEFAULT_PORT);
   strlcpy(s_cfg.token,    p.getString("mqTok",   "").c_str(), sizeof(s_cfg.token));
@@ -35,6 +36,7 @@ void cctv_mqtt_load_config() {
 void cctv_mqtt_save_config() {
   Preferences p;
   p.begin("iot", false);
+  p.putBool("mqEn",    s_cfg.enabled);
   p.putString("mqSrv",   s_cfg.server);
   p.putUShort("mqPort",  s_cfg.port);
   p.putString("mqTok",   s_cfg.token);
@@ -51,6 +53,10 @@ CctvMqttConfig& cctv_mqtt_config() { return s_cfg; }
 // ────────── connect / reconnect ──────────
 
 static bool mqttConnect() {
+  if (!s_cfg.enabled) {
+    s_status = "Disabled";
+    return false;
+  }
   if (s_cfg.token[0] == '\0') {
     s_status = "No token configured";
     return false;
@@ -90,9 +96,20 @@ bool cctv_mqtt_publish(const char* json) {
 
 static void mqttTask(void *) {
   uint32_t lastPushMs = 0;
-  bool pirWasAlert = false;
+  bool motionPrev        = false;
 
   for (;;) {
+    // Runtime disable switch: keep detection running, but stop MQTT traffic.
+    if (!s_cfg.enabled) {
+      if (s_mqtt.connected()) {
+        s_mqtt.disconnect();
+      }
+      s_connected = false;
+      s_status = "Disabled";
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
     // Reconnect loop
     if (!s_mqtt.connected()) {
       s_connected = false;
@@ -108,14 +125,14 @@ static void mqttTask(void *) {
 
     const uint32_t now = millis();
 
-    // Immediate push on PIR rising edge
-    bool pirNow = cctv_pir_alert();
-    if (pirNow && !pirWasAlert) {
+    // Camera motion edges: publish immediately on 0->1 and 1->0.
+    const bool motionNow = cctv_cam_motion_alert();
+    if (motionNow != motionPrev) {
       String json = cctv_telemetry_build_json();
       cctv_mqtt_publish(json.c_str());
       lastPushMs = now;
+      motionPrev = motionNow;
     }
-    pirWasAlert = pirNow;
 
     // Periodic telemetry push
     const uint32_t intervalMs = (uint32_t)s_cfg.pushIntervalS * 1000u;

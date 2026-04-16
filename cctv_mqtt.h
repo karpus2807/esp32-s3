@@ -18,6 +18,7 @@ const char* cctv_mqtt_status_str();
 
 // Runtime config (loaded from NVS, settable from web UI).
 struct CctvMqttConfig {
+  bool enabled;         // runtime switch (NVS key iot/mqEn)
   char server[64];
   uint16_t port;
   char token[64];       // ThingsBoard device access token

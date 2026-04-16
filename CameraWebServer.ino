@@ -20,7 +20,7 @@
 #include "cctv_time_sync.h"
 #include "cctv_web_control.h"
 #include "cctv_dht.h"
-#include "cctv_pir.h"
+#include "cctv_cam_motion.h"
 #include "cctv_mqtt.h"
 #include "cctv_telemetry.h"
 // Library includes for Arduino CLI dependency resolution
@@ -30,6 +30,19 @@
 #include "esp_heap_caps.h"
 #include <esp_task_wdt.h>
 #include <sdkconfig.h>
+#include <cstdarg>
+#include <cstdio>
+#include <esp_log.h>
+
+// Route ESP_LOGx / IDF logs to USB Serial (CDC) so the monitor shows the same stream as Serial.print.
+static int cctv_log_to_serial(const char *fmt, va_list ap) {
+  char buf[512];
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  if (n > 0) {
+    Serial.print(buf);
+  }
+  return n;
+}
 
 #define DBG_PORT Serial
 #if CCTV_SERIAL_VERBOSE
@@ -66,14 +79,32 @@ static bool cctv_task_create_caps(TaskFunction_t fn,
 
 static void cctv_apply_wifi_throughput_tuning() {
 #if CONFIG_ESP_WIFI_ENABLED
+  // Drop 11b — legacy 1-11 Mbps rates waste air time and increase latency.
+  // 11g/n only → min rate 6 Mbps, HT rates up to 150 Mbps.
   (void)esp_wifi_set_protocol(WIFI_IF_STA,
-                               WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-  (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40);
-  // AMPDU: aggregate multiple frames into one WiFi transmission — higher throughput.
+                               WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+
+  // HT20 is more stable than HT40 in congested environments (campus/apartment).
+  // HT40 needs a clean secondary channel — if there's interference, the driver
+  // falls back to HT20 anyway but wastes time probing. Force HT20 for low latency.
+  (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+  // Listen interval = 1 → check every beacon (~102ms at 100ms BI).
+  // Default can be 3-10 which adds 200-1000ms latency to incoming packets.
   wifi_config_t wc = {};
   if (esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK) {
-    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    wc.sta.listen_interval = 1;
+    (void)esp_wifi_set_config(WIFI_IF_STA, &wc);
   }
+
+  // Country code for India — proper regulatory + all 13 channels available
+  wifi_country_t cc = {};
+  cc.cc[0] = 'I'; cc.cc[1] = 'N'; cc.cc[2] = ' ';
+  cc.schan = 1;
+  cc.nchan = 13;
+  cc.max_tx_power = 78;  // 19.5 dBm in 0.25 dBm units
+  cc.policy = WIFI_COUNTRY_POLICY_MANUAL;
+  (void)esp_wifi_set_country(&cc);
 #endif
 }
 
@@ -104,6 +135,9 @@ String g_sdStatusMessage = "Not initialized";
 String g_cameraStatusMessage = "Booting";
 String g_recordingStatus = "Initializing";
 String g_recordingFile;
+
+// Set true while deleting/formatting SD content so the recorder can stop cleanly.
+volatile bool g_sdWipeInProgress = false;
 
 
 bool g_sdInitPending = true;
@@ -272,9 +306,10 @@ bool connectWifi(uint32_t timeoutMs) {
 #if CONFIG_ESP_WIFI_ENABLED
     (void)WiFi.setTxPower(WIFI_POWER_19_5dBm);
 #endif
-    // Disable power save AFTER connection — calling before WiFi.begin() has no effect
-    // because the driver resets ps mode during association handshake.
-    // WIFI_PS_NONE = no modem sleep, no beacon-aligned wakeup, ~0ms latency
+    // Re-apply tuning post-connect (WiFi.begin resets some driver settings)
+    cctv_apply_wifi_throughput_tuning();
+
+    // Disable power save AFTER connection — must be after association handshake.
     esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
     wifi_ps_type_t ps_check = WIFI_PS_MAX_MODEM;
     esp_wifi_get_ps(&ps_check);
@@ -337,6 +372,14 @@ static void wifiStationBackgroundTask(void *) {
     if (WiFi.status() == WL_CONNECTED) {
       tries = 0;
       g_wifiRetryExhausted = false;
+      // Driver can silently re-enable power save after roaming/reassociation.
+      // Force it off every cycle to keep latency low.
+      wifi_ps_type_t ps = WIFI_PS_MAX_MODEM;
+      esp_wifi_get_ps(&ps);
+      if (ps != WIFI_PS_NONE) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        WiFi.setSleep(false);
+      }
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
     }
@@ -728,28 +771,117 @@ size_t clearCaptures(String *message) {
     return 0;
   }
 
-  File root = SD_MMC.open("/captures");
-  if (!root || !root.isDirectory()) {
-    g_sdStatusMessage = "Capture folder not available";
+  g_sdWipeInProgress = true;
+  const uint32_t waitStart = millis();
+  // Give recording task a moment to close the current segment file.
+  while (g_recordingFile.length() > 0 && (millis() - waitStart) < 3000) {
+    delay(50);
+  }
+
+  // Recursive delete under /captures (handles nested dirs + hidden files).
+  std::function<size_t(const String&)> rmrf = [&](const String &dirPath) -> size_t {
+    size_t removed = 0;
+    File dir = SD_MMC.open(dirPath);
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
+      return 0;
+    }
+    File entry = dir.openNextFile();
+    while (entry) {
+      const bool isDir = entry.isDirectory();
+      String name = entry.name();
+      String full = dirPath;
+      if (!full.endsWith("/")) full += "/";
+      full += name;
+      entry.close();
+
+      // Don't try deleting the currently-open recording file (will fail).
+      if (!isDir && g_recordingFile.length() && full == g_recordingFile) {
+        entry = dir.openNextFile();
+        continue;
+      }
+
+      if (isDir) {
+        removed += rmrf(full);
+        if (SD_MMC.rmdir(full)) removed++;
+      } else {
+        if (SD_MMC.remove(full)) removed++;
+      }
+      entry = dir.openNextFile();
+    }
+    dir.close();
+    return removed;
+  };
+
+  size_t removed = rmrf("/captures");
+  g_sdWipeInProgress = false;
+
+  // Refresh FATFS free/used accounting (usedBytes can lag until remount).
+  (void)remountMicroSD();
+  g_sdStatusMessage = "Wiped " + String(removed) + " items";
+  g_lastSavedPath = "";
+  if (message != nullptr) {
+    *message = g_sdStatusMessage;
+  }
+  return removed;
+}
+
+// Deep-wipe everything on the SD card (recursive delete from root).
+// Note: filesystem metadata (FAT, root dir) still occupies a small amount — that's normal.
+size_t clearSdAll(String *message) {
+  if (!g_sdReady && !remountMicroSD()) {
     if (message != nullptr) {
       *message = g_sdStatusMessage;
     }
     return 0;
   }
 
-  size_t removed = 0;
-  File entry = root.openNextFile();
-  while (entry) {
-    String path = String("/captures/") + entry.name();
-    entry.close();
-    if (SD_MMC.remove(path)) {
-      removed++;
-    }
-    entry = root.openNextFile();
+  g_sdWipeInProgress = true;
+  const uint32_t waitStart = millis();
+  while (g_recordingFile.length() > 0 && (millis() - waitStart) < 3000) {
+    delay(50);
   }
-  root.close();
 
-  g_sdStatusMessage = "Cleared " + String(removed) + " files";
+  std::function<size_t(const String&)> rmrf = [&](const String &dirPath) -> size_t {
+    size_t removed = 0;
+    File dir = SD_MMC.open(dirPath);
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
+      return 0;
+    }
+    File entry = dir.openNextFile();
+    while (entry) {
+      const bool isDir = entry.isDirectory();
+      String name = entry.name();
+      String full = dirPath;
+      if (!full.endsWith("/")) full += "/";
+      full += name;
+      entry.close();
+
+      // Don't delete the currently-open recording file.
+      if (!isDir && g_recordingFile.length() && full == g_recordingFile) {
+        entry = dir.openNextFile();
+        continue;
+      }
+
+      if (isDir) {
+        removed += rmrf(full);
+        if (SD_MMC.rmdir(full)) removed++;
+      } else {
+        if (SD_MMC.remove(full)) removed++;
+      }
+      entry = dir.openNextFile();
+    }
+    dir.close();
+    return removed;
+  };
+
+  // Remove all entries under root (but do not try to remove "/").
+  size_t removed = rmrf("/");
+  g_sdWipeInProgress = false;
+
+  (void)remountMicroSD();
+  g_sdStatusMessage = "Deep wipe removed " + String(removed) + " items";
   g_lastSavedPath = "";
   if (message != nullptr) {
     *message = g_sdStatusMessage;
@@ -885,17 +1017,25 @@ void recordingTask(void *parameter) {
   const uint32_t kSegmentMs    = 30u * 60u * 1000u;     // 30 minutes per AVI segment
   const uint64_t kMinFreeBytes = 50ULL * 1024 * 1024;   // stop at < 50 MB free
 
-  // Unsubscribe this task from WDT so heavy OSD+SD writes can't trigger it.
-  // IDLE tasks on both cores remain subscribed (if enabled).
-  (void)esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+  // Do not call esp_task_wdt_delete() here: on Arduino-ESP32 this task is often
+  // never subscribed to the Task WDT, and delete() causes E "task not found" spam.
+  // Recorder runs on core 1 with yields/delays; see inner loop vTaskDelay.
 
   AviRecorder recorder;
 
   while (true) {
-    // No valid clock → don't record (files need correct timestamps)
+    if (g_sdWipeInProgress) {
+      g_recordingStatus = "SD maintenance (wipe/format)";
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    // Time-gated recording: only record when wall clock is sane (date/time available).
+    // If time isn't available, keep the task idle; resume immediately after time sync.
     if (!cctv_wall_clock_sane()) {
-      g_recordingStatus = "Waiting for time sync\xe2\x80\xa6";
-      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      cctv_time_kick_sync_if_needed(false);
+      g_recordingStatus = "Waiting for time sync";
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
       continue;
     }
 
@@ -920,10 +1060,15 @@ void recordingTask(void *parameter) {
 
     g_recordingFile = path;
     const uint32_t segStart = millis();
+    // Wall-clock grid: frame i is due at segStart + i * kFrameMs. If we fall behind by
+    // a full slot, skip indices (drop) instead of bursting — keeps OSD time vs playback aligned.
     uint32_t frameIdx = 0;
-    bool timeLost = false;
 
-    while (g_sdReady && !timeLost && (millis() - segStart < kSegmentMs)) {
+    while (g_sdReady && (millis() - segStart < kSegmentMs)) {
+      if (g_sdWipeInProgress) {
+        g_recordingStatus = "Stopping for SD maintenance";
+        break;
+      }
       // Catch up dropped frames in O(1) — the old inner while incremented frameIdx in a
       // tight loop and could starve IDLE0 → task_wdt / Guru Meditation on busy builds.
       const uint32_t wall = millis() - segStart;
@@ -954,6 +1099,7 @@ void recordingTask(void *parameter) {
       const pixformat_t pixFmt = fb->format;
       uint8_t *slot = nullptr;
       size_t slotLen = 0;
+      bool slot_caps = false;
 
       uint16_t stamp_w = fb->width;
       uint16_t stamp_h = fb->height;
@@ -968,19 +1114,36 @@ void recordingTask(void *parameter) {
         if (slot) {
           memcpy(slot, fb->buf, fb->len);
           slotLen = fb->len;
+          slot_caps = true;
         }
       } else {
         frame2jpg(fb, CCTV_JPEG_QUALITY, &slot, &slotLen);
+        slot_caps = false;  // frame2jpg() allocates with malloc()
       }
 
       esp_camera_fb_return(fb);
       cctv_camera_unlock();
 
 #if CCTV_ENABLE_FRAME_OSD && CCTV_OSD_ON_RECORDING
-      // Stamp OSD only every Nth frame (~1/sec) to cut CPU by ~90%.
-      // Non-stamped frames pass through as raw camera JPEG (no decode+encode).
-      if (slot && slotLen > 0 && pixFmt == PIXFORMAT_JPEG &&
-          (frameIdx % CCTV_OSD_STAMP_EVERY_N) == 0) {
+      // Use recorder.frameCount() (monotonic per written frame), not frameIdx — the
+      // scheduler can skip frameIdx values when catching up, which skipped OSD stamps.
+      // Ensure buffer is heap_caps_free()-compatible (cctvStampJpegBottomBar frees input).
+      if (slot && slotLen > 0 && !slot_caps) {
+        uint8_t *cpy = (uint8_t *)heap_caps_malloc(slotLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!cpy) {
+          cpy = (uint8_t *)heap_caps_malloc(slotLen, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (cpy) {
+          memcpy(cpy, slot, slotLen);
+          free(slot);
+          slot = cpy;
+          slot_caps = true;
+        }
+      }
+
+      if (slot && slotLen > 0 && slot_caps &&
+          (CCTV_OSD_STAMP_EVERY_N_RECORD <= 1 ||
+           (recorder.frameCount() % CCTV_OSD_STAMP_EVERY_N_RECORD) == 0)) {
         (void)cctvStampJpegBottomBar(
             &slot, &slotLen, stamp_w, stamp_h, (int)CCTV_OSD_JPEG_QUALITY_RECORD);
         vTaskDelay(1);  // yield after heavy JPEG decode+encode
@@ -994,7 +1157,7 @@ void recordingTask(void *parameter) {
       }
 
       if (slot) {
-        if (pixFmt == PIXFORMAT_JPEG) {
+        if (slot_caps) {
           heap_caps_free(slot);
         } else {
           free(slot);
@@ -1003,13 +1166,8 @@ void recordingTask(void *parameter) {
 
       frameIdx++;
 
+      // Update status string every ~30 frames (~2 s)
       if (recorder.frameCount() % 30 == 0) {
-        // Check clock every ~2 sec — if time lost, emergency save
-        if (!cctv_wall_clock_sane()) {
-          timeLost = true;
-          SDBGln(F("[REC] Clock lost — emergency save"));
-          break;
-        }
         String fname = path.substring(path.lastIndexOf('/') + 1);
         g_recordingStatus = "REC " + fname + " [" + String(recorder.frameCount()) + "]";
       }
@@ -1020,13 +1178,8 @@ void recordingTask(void *parameter) {
     recorder.end(wallSpan);
     g_recordingFile = "";
     String fname = path.substring(path.lastIndexOf('/') + 1);
-    if (timeLost) {
-      g_recordingStatus = "Saved (clock lost): " + fname + " (" + String(savedFrames) + " fr)";
-      SDBGf("[REC] Emergency save: %s  %u frames\n", path.c_str(), savedFrames);
-    } else {
-      g_recordingStatus = "Saved: " + fname + " (" + String(savedFrames) + " fr)";
-      SDBGf("[REC] Segment: %s  %u frames\n", path.c_str(), savedFrames);
-    }
+    g_recordingStatus = "Saved: " + fname + " (" + String(savedFrames) + " fr)";
+    SDBGf("[REC] Segment: %s  %u frames\n", path.c_str(), savedFrames);
   }
 }
 
@@ -1060,10 +1213,18 @@ void setup() {
 #if CCTV_SERIAL_VERBOSE || CCTV_ENABLE_SERIAL_CONSOLE
   DBG_PORT.begin(115200);
   delay(200);
+  Serial.setDebugOutput(true);
+  (void)esp_log_set_vprintf(cctv_log_to_serial);
+  (void)esp_log_level_set("*", ESP_LOG_INFO);
 #else
-  // USB CDC may still enumerate; no chatty serial boot.
+  // USB CDC: always print a line (SDBG* is disabled when CCTV_SERIAL_VERBOSE=0).
   Serial.begin(115200);
-  delay(50);
+  delay(150);
+  Serial.setDebugOutput(true);
+  (void)esp_log_set_vprintf(cctv_log_to_serial);
+  (void)esp_log_level_set("*", ESP_LOG_INFO);
+  Serial.print(F("\n\n=== CCTV boot 115200 baud ===\n"));
+  Serial.flush();
 #endif
   cctv_platform_init();
 #if CONFIG_SPIRAM_USE_MALLOC
@@ -1165,7 +1326,7 @@ void setup() {
 
   // ── v2.0 Addon modules: DHT, PIR, MQTT ──────────────────────────────
   cctv_dht_init();              // DHT11 sensor + background read task
-  cctv_pir_init();              // PIR ISR on GPIO 41
+  cctv_cam_motion_init();       // camera frame-diff motion detector
   cctv_mqtt_init();             // Load MQTT config from NVS
 
   loadWifiConfig();
@@ -1202,6 +1363,8 @@ void setup() {
   cctv_net_apply_fallback_dns();
   if (ethDhcpOk) {
     SDBGf("[ETH] IPv4 OK  IP: %s\n", cctv_primary_local_ip().toString().c_str());
+    // If LAN came up first (no WiFi), kick time sync immediately.
+    cctv_time_kick_sync_if_needed(true);
   } else {
     SDBGln(F("[ETH] No DHCP in wait window — web UI still starts (use WiFi IP or fix LAN DHCP)."));
 #if CCTV_SERIAL_VERBOSE

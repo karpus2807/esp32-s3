@@ -11,7 +11,7 @@
 #include <algorithm>
 
 #include "board_config.h"
-#include "avi_recorder.h"
+#include "cctv_rec_writer.h"
 #include "cctv_osd.h"
 #include "cctv_platform.h"
 #include "cctv_net.h"
@@ -1009,8 +1009,8 @@ void clearWifiConfig() {
 
 // ─── Recording task ────────────────────────────────────────────────────────
 
-// Runs on Core 0 — records AVI segments. Camera is locked only while grabbing
-// and copying a frame; SD writes run without the lock so HTTP /stream stays smooth.
+// Runs on Core 0 — records AVI segments. Camera mutex is held only for fb_get +
+// memcpy; SD writes run on the RecWr task so slow SD does not block /stream.
 void recordingTask(void *parameter) {
   const uint8_t  kFps          = CCTV_RECORD_FPS;
   const uint32_t kFrameMs      = 1000u / kFps;
@@ -1019,9 +1019,6 @@ void recordingTask(void *parameter) {
 
   // Do not call esp_task_wdt_delete() here: on Arduino-ESP32 this task is often
   // never subscribed to the Task WDT, and delete() causes E "task not found" spam.
-  // Recorder runs on core 1 with yields/delays; see inner loop vTaskDelay.
-
-  AviRecorder recorder;
 
   while (true) {
     if (g_sdWipeInProgress) {
@@ -1052,13 +1049,14 @@ void recordingTask(void *parameter) {
     }
 
     String path = buildAviPath();
-    if (!recorder.begin(path, 640, 480, kFps)) {
+    if (!cctv_rec_writer_begin(path.c_str(), 640, 480, kFps)) {
       g_recordingStatus = "Cannot create AVI file";
       vTaskDelay(2000 / portTICK_PERIOD_MS);
       continue;
     }
 
     g_recordingFile = path;
+    uint32_t segWritten = 0;
     const uint32_t segStart = millis();
     // Wall-clock grid: frame i is due at segStart + i * kFrameMs. If we fall behind by
     // a full slot, skip indices (drop) instead of bursting — keeps OSD time vs playback aligned.
@@ -1143,15 +1141,17 @@ void recordingTask(void *parameter) {
 
       if (slot && slotLen > 0 && slot_caps &&
           (CCTV_OSD_STAMP_EVERY_N_RECORD <= 1 ||
-           (recorder.frameCount() % CCTV_OSD_STAMP_EVERY_N_RECORD) == 0)) {
+           (segWritten % CCTV_OSD_STAMP_EVERY_N_RECORD) == 0)) {
         (void)cctvStampJpegBottomBar(
             &slot, &slotLen, stamp_w, stamp_h, (int)CCTV_OSD_JPEG_QUALITY_RECORD);
-        vTaskDelay(1);  // yield after heavy JPEG decode+encode
+        taskYIELD();
       }
 #endif
 
       if (slot && slotLen > 0) {
-        recorder.writeFrame(slot, slotLen);
+        cctv_rec_writer_submit(slot, slotLen, slot_caps);
+        slot = nullptr;
+        segWritten++;
       } else {
         vTaskDelay(2 / portTICK_PERIOD_MS);
       }
@@ -1167,15 +1167,15 @@ void recordingTask(void *parameter) {
       frameIdx++;
 
       // Update status string every ~30 frames (~2 s)
-      if (recorder.frameCount() % 30 == 0) {
+      if (segWritten > 0 && (segWritten % 30) == 0) {
         String fname = path.substring(path.lastIndexOf('/') + 1);
-        g_recordingStatus = "REC " + fname + " [" + String(recorder.frameCount()) + "]";
+        g_recordingStatus = "REC " + fname + " [" + String(segWritten) + "]";
       }
     }
 
-    uint32_t savedFrames = recorder.frameCount();
+    const uint32_t savedFrames = segWritten;
     const uint32_t wallSpan = millis() - segStart;
-    recorder.end(wallSpan);
+    cctv_rec_writer_end(wallSpan);
     g_recordingFile = "";
     String fname = path.substring(path.lastIndexOf('/') + 1);
     g_recordingStatus = "Saved: " + fname + " (" + String(savedFrames) + " fr)";
@@ -1382,7 +1382,7 @@ void setup() {
   // Do not auto-retry mini-DHCP at boot: some ETH netif builds reject DHCPS and spam logs.
 #endif
 
-  // HTTP server: control on Core 0, stream on Core 1 (set inside startCameraServer)
+  // HTTP server: httpd worker pinned to Core 1 (see app_httpd.cpp httpd_start config).
   if (!startCameraServer()) {
     Serial.println(F("[HTTP] FATAL: httpd_start failed — web UI unavailable (check heap / port 80)"));
     Serial.flush();
@@ -1408,6 +1408,8 @@ void setup() {
   // HTTP world-clock sync deferred — ntp_housekeeping_timer_cb will retry every 8s.
   // Blocking at boot wastes time on local-only LANs (no internet → HTTP timeout).
 
+  cctv_rec_writer_init();
+
   // SD init on Core 0 — PSRAM stack frees ~8 KB internal (OPI PSRAM builds)
   (void) cctv_task_create_caps(
     sdInitBackgroundTask,
@@ -1419,16 +1421,15 @@ void setup() {
     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
     &sdInitTaskHandle);
 
-  // Continuous AVI recording on Core 1 — IDLE1 is not WDT-monitored by default
-  // on ESP32-S3 Arduino, so heavy OSD+SD writes won't trigger task_wdt.
-  // HTTPD (Core 1, prio idle+5=6) still preempts Recorder (prio 3) for web requests.
+  // AVI capture on Core 0 prio 4; SD writes on Core 0 prio 3 (RecWr). HTTPD stays on Core 1,
+  // so MJPEG + browser load do not time-slice with capture the way a single-core burst did.
   (void) cctv_task_create_caps(
     recordingTask,
     "Recorder",
     20 * 1024,
     nullptr,
-    3,
-    1,
+    4,
+    0,
     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
     &recordingTaskHandle);
 
